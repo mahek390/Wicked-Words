@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Data (not committed — shared via Drive)
+Data/
+
+# Pipeline outputs
+outputs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.parquet
+
+# macOS
+.DS_Store
