@@ -7,7 +7,7 @@ Usage:
     python run_pipeline.py --csv data/survey.csv --images data/images/ [--limit 10]
 
 Environment:
-    export GEMINI_API_KEY="your_key_here"
+    export GEMINI_API_KEY="AIzaSyAPgrMIsXV9nc6QajoTiYRnH1yi0lzOCog"
 
 Outputs (in outputs/):
     results.parquet           — full merged analytics dataset
