@@ -89,10 +89,10 @@ def clean(df: pd.DataFrame, image_dir: Path) -> dict:
         df = drop(df[COL_DISTRIBUTION] == "preview", "preview_submission")
     log.info(f"After preview drop: {len(df)} rows")
 
-    # ── 2. Drop incomplete progress ─────────────────────────────────────────
+    # ── 2. Drop incomplete progress (keep 50–100) ───────────────────────────
     if COL_PROGRESS in df.columns:
         df[COL_PROGRESS] = pd.to_numeric(df[COL_PROGRESS], errors="coerce")
-        df = drop(df[COL_PROGRESS] < 100, "incomplete_progress")
+        df = drop(df[COL_PROGRESS] < 50, "incomplete_progress")
     log.info(f"After progress drop: {len(df)} rows")
 
     # ── 3. Consent check ───────────────────────────────────────────────────
@@ -101,12 +101,10 @@ def clean(df: pd.DataFrame, image_dir: Path) -> dict:
         df = drop(~consented, "no_consent")
     log.info(f"After consent drop: {len(df)} rows")
 
-    # ── 4. Eligibility screens ──────────────────────────────────────────────
+    # ── 4. Eligibility screens (consent + age + english only) ───────────────
     elig_map = {
-        COL_US_RESIDENT: "not_us_resident",
-        COL_ENGLISH:     "cannot_read_english",
-        COL_AGE_18:      "under_18",
-        COL_ENROLLED:    "not_enrolled_wpws",
+        COL_ENGLISH: "cannot_read_english",
+        COL_AGE_18:  "under_18",
     }
     for col, reason in elig_map.items():
         if col in df.columns:
@@ -122,21 +120,9 @@ def clean(df: pd.DataFrame, image_dir: Path) -> dict:
         )
         log.info(f"Flagged {fast_mask.sum()} fast submissions (< {MIN_DURATION_SEC}s)")
 
-    # ── 6. Deduplicate by participant email ─────────────────────────────────
-    #    Per Dr. He: one participant may submit multiple times.
-    #    Email is the reliable cross-submission identifier.
-    #    Keep all submissions (multiple photos per person is valid research data),
-    #    but flag duplicates so analysts can study within-participant patterns.
+    # ── 6. Assign participant index by email (no flagging) ──────────────────
+    #    Per Dr. He: multiple submissions per participant is expected and valid.
     if COL_EMAIL_ID in df.columns:
-        email_counts = df[COL_EMAIL_ID].value_counts()
-        repeat_emails = email_counts[email_counts > 1].index
-        repeat_mask = df[COL_EMAIL_ID].isin(repeat_emails)
-        df.loc[repeat_mask, "_flags"] = df.loc[repeat_mask, "_flags"].apply(
-            lambda f: f + ["repeat_participant"]
-        )
-        log.info(f"Flagged {repeat_mask.sum()} rows from repeat participants")
-
-        # Assign participant index for grouping (anonymized)
         email_to_pid = {e: i for i, e in enumerate(df[COL_EMAIL_ID].dropna().unique())}
         df["participant_idx"] = df[COL_EMAIL_ID].map(email_to_pid)
         df["submission_number"] = df.groupby(COL_EMAIL_ID).cumcount() + 1
