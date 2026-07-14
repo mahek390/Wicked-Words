@@ -5,11 +5,6 @@ Loads the Qualtrics export, applies cleaning rules, and produces:
   - df_clean      : rows valid for image pipeline (has image + full consent)
   - df_survey_only: valid survey rows without usable images
   - failed_log    : all dropped rows with reason codes
-
-Key update from Dr. He (Jun 15 email):
-  One participant may submit multiple samples. Use the anonymized email
-  field as the participant identifier (more reliable than name).
-  Multiple ResponseIds can share the same fake email → same participant.
 """
 
 import pandas as pd

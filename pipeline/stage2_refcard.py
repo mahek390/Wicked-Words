@@ -10,8 +10,7 @@ For each image, uses Gemini to:
 The scale factor converts all subsequent pixel measurements to real-world cm,
 enabling visual angle calculation and Snellen-equivalent acuity estimates.
 
-Note: SAM integration is stubbed with a clear interface — swap in the real
-SAM predictor when GPU/checkpoint is available. Gemini bbox alone is
+Note: SAM integration is stubbed with a clear interface (need to swap in the real SAM predictor when GPU/checkpoint is available) Gemini bbox alone is
 sufficient for an initial pipeline run.
 """
 
@@ -148,7 +147,7 @@ def compute_scale_factor(
     }
 
 
-# ── SAM stub ─────────────────────────────────────────────────────────────────
+# ── SAM stub 
 
 def refine_mask_with_sam(image_np: np.ndarray, bbox_frac: list[float]) -> np.ndarray | None:
     """
@@ -229,7 +228,7 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
         result["stage2_flags"].append("card_not_found")
         return result
 
-    # ── Quality flags ─────────────────────────────────────────────────────────
+    # Quality flags 
     if result["card_occluded"]:
         result["stage2_flags"].append("card_occluded")
     if result["card_blurry"]:
@@ -239,7 +238,7 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
     if result["card_confidence"] == "low":
         result["stage2_flags"].append("low_confidence")
 
-    # ── Compute scale factor ──────────────────────────────────────────────────
+    # Compute scale factor 
     if result["calibration_bar_bbox"] is None:
         result["scale_error"] = "bar_not_found"
         result["stage2_flags"].append("bar_not_found")
