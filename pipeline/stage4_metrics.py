@@ -186,6 +186,127 @@ def compute_color_contrast(text_rgb: list | None, bg_rgb: list | None) -> dict:
     }
 
 
+# ── Readability prediction ───────────────────────────────────────────────────
+
+# Human acuity reference points (logMAR → difficulty weight)
+# Based on clinical vision standards:
+#   logMAR 0.0  = 20/20  perfect acuity  → weight 1.0 (no extra difficulty)
+#   logMAR 0.3  = 20/40  mild impairment → weight 1.3
+#   logMAR 1.0  = 20/200 legal blindness → weight 2.5
+ACUITY_BREAKPOINTS = [
+    (0.0,  1.0),
+    (0.3,  1.3),
+    (0.5,  1.6),
+    (1.0,  2.5),
+    (2.0,  4.0),
+]
+
+
+def _acuity_weight(logmar: float) -> float:
+    """Interpolate difficulty weight from logMAR value."""
+    if logmar is None or math.isnan(logmar):
+        return 1.0
+    for i in range(len(ACUITY_BREAKPOINTS) - 1):
+        lm0, w0 = ACUITY_BREAKPOINTS[i]
+        lm1, w1 = ACUITY_BREAKPOINTS[i + 1]
+        if lm0 <= logmar <= lm1:
+            t = (logmar - lm0) / (lm1 - lm0)
+            return round(w0 + t * (w1 - w0), 3)
+    return ACUITY_BREAKPOINTS[-1][1]
+
+
+def predict_text_behavior(visual_angle: float | None, logmar: float | None,
+                          wcag_ratio: float | None,
+                          michelson: float | None) -> dict:
+    """
+    Predict whether the text environment is objectively readable.
+    Based purely on physical/optical metrics — no human input.
+
+    Rules derived from vision science literature:
+      - Visual angle < 0.1° → too small for most people (below acuity limit)
+      - Visual angle 0.1–0.5° → borderline / requires effort
+      - Visual angle > 0.5° → comfortably large
+      - WCAG ratio < 3.0 → poor contrast (fails all accessibility standards)
+      - WCAG ratio 3.0–4.5 → marginal (passes large text only)
+      - WCAG ratio >= 4.5 → adequate contrast
+      - Michelson < 0.3 → low pixel contrast
+    """
+    issues = []
+    score = 100  # start at 100, deduct for each issue
+
+    # Size assessment
+    if visual_angle is not None:
+        if visual_angle < 0.1:
+            issues.append("text_too_small")
+            score -= 40
+        elif visual_angle < 0.5:
+            issues.append("text_borderline_size")
+            score -= 15
+
+    # Contrast assessment
+    if wcag_ratio is not None:
+        if wcag_ratio < 3.0:
+            issues.append("contrast_fail")
+            score -= 35
+        elif wcag_ratio < 4.5:
+            issues.append("contrast_marginal")
+            score -= 15
+
+    if michelson is not None and michelson < 0.3:
+        issues.append("low_pixel_contrast")
+        score -= 10
+
+    score = max(0, score)
+
+    if score >= 75:
+        text_behavior = "readable"
+    elif score >= 45:
+        text_behavior = "challenging"
+    else:
+        text_behavior = "unreadable"
+
+    return {
+        "text_behavior_score": score,
+        "text_behavior_pred":  text_behavior,
+        "text_behavior_issues": issues,
+    }
+
+
+def predict_human_behavior(visual_angle: float | None, logmar: float | None,
+                           wcag_ratio: float | None,
+                           michelson: float | None) -> dict:
+    """
+    Predict human reading difficulty, adjusted for human visual acuity.
+
+    The acuity weight fine-tunes the raw text difficulty score:
+    a text that is borderline for perfect vision becomes much harder
+    for someone with reduced acuity (higher logMAR).
+
+    difficulty_score = (100 - text_behavior_score) * acuity_weight
+    Clamped to [0, 100]. Higher = harder for a human to read.
+    """
+    text_pred = predict_text_behavior(visual_angle, logmar, wcag_ratio, michelson)
+    raw_difficulty = 100 - text_pred["text_behavior_score"]
+    acuity_w = _acuity_weight(logmar if logmar is not None else 0.0)
+    difficulty = min(100, round(raw_difficulty * acuity_w, 1))
+
+    if difficulty < 25:
+        human_pred = "easy"
+    elif difficulty < 55:
+        human_pred = "moderate_effort"
+    elif difficulty < 80:
+        human_pred = "difficult"
+    else:
+        human_pred = "very_difficult"
+
+    return {
+        "acuity_weight":        acuity_w,
+        "human_difficulty_score": difficulty,
+        "human_behavior_pred":  human_pred,
+        **text_pred,
+    }
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def compute_all_metrics(
@@ -204,10 +325,17 @@ def compute_all_metrics(
     crop_path = crops_dir / f"{response_id}_target.jpg"
     pixel_contrast = compute_pixel_contrast(crop_path)
     color_contrast = compute_color_contrast(text_rgb, bg_rgb)
+    predictions = predict_human_behavior(
+        visual_angle=size.get("visual_angle_deg"),
+        logmar=size.get("logmar"),
+        wcag_ratio=color_contrast.get("wcag_contrast_ratio"),
+        michelson=pixel_contrast.get("michelson_contrast"),
+    )
 
     return {
         "response_id": response_id,
         **size,
         **pixel_contrast,
         **color_contrast,
+        **predictions,
     }

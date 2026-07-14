@@ -1,47 +1,43 @@
 """
 Wicked Words Pipeline — Main Runner
 =====================================
-Orchestrates all 5 stages for a given data directory.
+Stage 0 : De-identification  — blur faces/plates in images, strip PII from CSV
+Stage 1 : Data cleaning      — filter invalid submissions, assign participant IDs
+Stage 2 : Ref card detection — Gemini detects calibration card, computes px/cm
+Stage 3 : Target text        — Gemini extracts text region, colors, cap height
+Stage 4 : Metrics            — visual angle, logMAR, contrast, readability predictions
+Stage 5 : Fusion + output    — merge all results, write CSV / parquet
 
-Usage:
-    python run_pipeline.py --csv data/survey.csv --images data/images/ [--limit 10]
-
-Environment:
-    export GEMINI_API_KEY="AIzaSyAPgrMIsXV9nc6QajoTiYRnH1yi0lzOCog"
+IMPORTANT: Stages 2 and 3 send images to Gemini.
+           They ONLY receive de-identified images from Stage 0 output.
+           Original images never leave the local machine.
 
 Outputs (in outputs/):
-    results.parquet           — full merged analytics dataset
-    results.csv               — same, CSV format
-    participant_summary.csv   — aggregated per-participant metrics
-    flagged_for_review.csv    — rows needing human RA review
-    failed_log_<ts>.csv       — dropped rows with reason codes
-    clean_image_rows.csv      — Stage 1 output (reference)
+    deidentified/images/          — blurred copies sent to AI
+    deidentified/survey_deidentified.csv
+    results.csv / results.parquet — full merged analytics
+    participant_summary.csv
+    flagged_for_review.csv
+    failed_log_<ts>.csv
 """
 
+import os
 import sys
 import logging
 import argparse
 from pathlib import Path
 from tqdm import tqdm
 
-# Allow running from project root
-sys.path.insert(0, str(Path(__file__).parent / "pipeline"))
-
-import os
-import sys
-
-# Track down the absolute path to your pipeline folder
 base_dir = os.path.dirname(os.path.abspath(__file__))
-pipeline_path = os.path.join(base_dir, "pipeline")
-sys.path.append(pipeline_path)
+sys.path.insert(0, os.path.join(base_dir, "pipeline"))
 
-# Now Python can see it as a direct, local file
-import pipeline.stage1_cleaning as s1
-import pipeline.stage2_refcard as s2
-import pipeline.stage3_target   as s3
-import pipeline.stage4_metrics  as s4
-import pipeline.stage5_fusion   as s5
-from config import IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR
+import pipeline.stage0_deidentify as s0
+import pipeline.stage1_cleaning   as s1
+import pipeline.stage2_refcard    as s2
+import pipeline.stage3_target     as s3
+import pipeline.stage4_metrics    as s4
+import pipeline.stage5_fusion     as s5
+from config import IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR, DEIDENT_IMAGE_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,46 +62,50 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
     if limit:
         df_clean = df_clean.head(limit)
         log.info(f"Running on first {limit} rows (--limit flag)")
-
     log.info(f"Processing {len(df_clean)} image rows")
 
-    # ── Stages 2–4: Per-image processing ─────────────────────────────────────
+    # ── Stage 0: De-identification ────────────────────────────────────────────
+    # Must run BEFORE any image is sent to an AI service.
+    # Uses original image_dir as source; writes blurred copies to deidentified/.
+    log.info("\n── Stage 0: De-identification (privacy firewall) ──")
+    deident = s0.run(df_raw, image_dir)
+    deident_image_dir = deident["deident_image_dir"]
+    log.info(f"  AI will use images from: {deident_image_dir}")
+
+    # ── Stages 2–4: Per-image processing (using de-identified images) ─────────
     stage2_results = []
     stage3_results = []
     stage4_results = []
 
     for _, row in tqdm(df_clean.iterrows(), total=len(df_clean), desc="Processing images"):
         rid = str(row.get(s1.COL_RESPONSE_ID, ""))
-        img_path = s1.get_image_path(rid, image_dir)
 
-        if img_path is None:
-            log.warning(f"{rid}: image file not found on disk")
+        # Always resolve image path from de-identified folder
+        deident_path = s1.get_image_path(rid, deident_image_dir)
+        if deident_path is None:
+            log.warning(f"{rid}: de-identified image not found — skipping")
             continue
 
-        # Stage 2: Reference card
-        log.debug(f"{rid}: Stage 2 — ref card detection")
-        r2 = s2.process_image(rid, img_path, CROPS_DIR)
+        # Stage 2: Reference card (uses de-identified image)
+        r2 = s2.process_image(rid, deident_path, CROPS_DIR)
         stage2_results.append(r2)
 
-        # Skip if privacy flagged or card not found
         if r2.get("privacy_flag"):
-            log.warning(f"{rid}: privacy flag — skipping stages 3+4")
+            log.warning(f"{rid}: residual privacy flag after de-identification — skipping stages 3+4")
             continue
         if not r2.get("card_found"):
             log.info(f"{rid}: card not found — skipping stages 3+4")
             continue
 
-        # Stage 3: Target text
-        log.debug(f"{rid}: Stage 3 — target text extraction")
-        r3 = s3.process_image(rid, img_path, CROPS_DIR, card_bbox_frac=r2.get("card_bbox"))
+        # Stage 3: Target text (uses de-identified image)
+        r3 = s3.process_image(rid, deident_path, CROPS_DIR, card_bbox_frac=r2.get("card_bbox"))
         stage3_results.append(r3)
 
         if not r3.get("target_found"):
             log.info(f"{rid}: target not found — skipping stage 4")
             continue
 
-        # Stage 4: Metrics
-        log.debug(f"{rid}: Stage 4 — metrics")
+        # Stage 4: Metrics + predictions (local computation, no AI)
         r4 = s4.compute_all_metrics(
             response_id=rid,
             cap_height_px=r3.get("cap_height_px"),
@@ -135,8 +135,8 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wicked Words image analysis pipeline")
-    parser.add_argument("--csv",    type=Path, default=CSV_PATH,   help="Path to Qualtrics CSV export")
-    parser.add_argument("--images", type=Path, default=IMAGE_DIR,  help="Directory of submitted images")
-    parser.add_argument("--limit",  type=int,  default=None,       help="Process only first N image rows (for testing)")
+    parser.add_argument("--csv",    type=Path, default=CSV_PATH,  help="Path to Qualtrics CSV export")
+    parser.add_argument("--images", type=Path, default=IMAGE_DIR, help="Directory of submitted images")
+    parser.add_argument("--limit",  type=int,  default=None,      help="Process only first N image rows (for testing)")
     args = parser.parse_args()
     run(args.csv, args.images, args.limit)
