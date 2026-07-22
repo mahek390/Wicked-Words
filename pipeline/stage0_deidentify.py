@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic"}
 
-# ── OpenCV DNN face detector (ships with opencv-python, no extra download) ────
+# ── OpenCV DNN face detector (ships with opencv-python, no extra download)
 # Uses the Caffe model bundled with OpenCV
 _face_net = None
 

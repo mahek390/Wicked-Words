@@ -1,1 +1,14 @@
 python-dotenv
+openpyxl
+pandas
+numpy
+Pillow
+matplotlib
+pyarrow
+torch
+torchvision
+transformers
+timm
+einops
+tqdm
+opencv-python-headless

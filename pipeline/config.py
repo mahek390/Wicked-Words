@@ -25,11 +25,9 @@ DEIDENT_DIR       = OUTPUTS_DIR / "deidentified"
 DEIDENT_IMAGE_DIR = DEIDENT_DIR / "images"
 DEIDENT_CSV_PATH  = DEIDENT_DIR / "survey_deidentified.csv"
 
-# ── Gemini ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL       = "gemini-2.5-pro"
-GEMINI_MAX_RETRIES = 3
-GEMINI_RETRY_DELAY = 2.0   # seconds, doubles on each retry
+# ── Local model ──────────────────────────────────────────────────────────────
+# Florence-2 runs locally on Apple Silicon — no API key needed
+FLORENCE_MODEL_ID = "microsoft/Florence-2-large"
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 CALIB_BAR_CM        = 8.0    # physical width of the calibration bar on the reference card

@@ -38,7 +38,6 @@ import pipeline.stage3_target     as s3
 import pipeline.stage4_metrics    as s4
 import pipeline.stage5_fusion     as s5
 from config import IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR, DEIDENT_IMAGE_DIR
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -110,8 +109,7 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
             response_id=rid,
             cap_height_px=r3.get("cap_height_px"),
             px_per_cm=r2.get("px_per_cm"),
-            text_rgb=r3.get("text_color_rgb"),
-            bg_rgb=r3.get("background_color_rgb"),
+            calib_bar_px=r2.get("corrected_bar_px"),
             crops_dir=CROPS_DIR,
         )
         stage4_results.append(r4)

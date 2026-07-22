@@ -1,74 +1,73 @@
 """
 Stage 3 — Target Text Detection & Extraction
 =============================================
-Identifies the "wicked" text in the scene background (the text the
-participant found difficult to read), crops it out, and extracts:
-  - bounding box (fractional)
-  - OCR'd text content (via Gemini)
-  - theme classification
-  - estimated font height in pixels
-  - background / text color estimates
-
-The reference card is explicitly excluded — Gemini is told to ignore it
-and focus only on the environmental text behind the participant's hand.
+Uses Florence-2 (local, no API) to find the background text the participant
+photographed, crop it, and extract metrics for Stage 4.
 """
 
-import json
-import time
 import logging
+import numpy as np
 from pathlib import Path
 from PIL import Image
-
-from config import (
-    GEMINI_API_KEY, GEMINI_MODEL, GEMINI_MAX_RETRIES, GEMINI_RETRY_DELAY,
-)
-from stage2_refcard import _call_gemini, bbox_crop, refine_mask_with_sam
-import numpy as np
-
+from stage2_refcard import bbox_crop
+from local_model import detect_object, dense_caption, ocr_with_regions, caption
 log = logging.getLogger(__name__)
 
-
-# ── Gemini prompt ─────────────────────────────────────────────────────────────
-
-TARGET_SYSTEM = (
-    "You are a vision analysis assistant for the Wicked Words citizen science project. "
-    "Participants photograph text they find difficult to read in everyday life while "
-    "holding a Wicked Words reference card in front of the scene. "
-    "Your job is to find and analyze the BACKGROUND TEXT — the text the participant "
-    "found difficult — NOT the reference card itself. "
-    "Return ONLY valid JSON. No markdown, no explanation."
-)
-
-TARGET_PROMPT = """This photo shows a person holding a Wicked Words reference card in front of some text.
-
-IGNORE the reference card entirely.
-
-Find the TARGET TEXT — the text in the scene background that the participant
-found difficult to read. It could be: a sign, menu, food label, newspaper,
-poster, package, digital screen, book, or any other everyday text.
-
-Return JSON:
-{
-  "target_found": true | false,
-  "target_bbox": [x1, y1, x2, y2] | null,
-  "text_content": "<exact text if readable, truncated to 300 chars>" | null,
-  "text_readable": true | false,
-  "text_theme": "signage" | "packaging" | "print_media" | "digital_screen" | "handwritten" | "other",
-  "estimated_cap_height_px": <height of a capital letter in pixels> | null,
-  "background_luminance": "light" | "dark" | "mixed",
-  "text_luminance": "light" | "dark" | "mixed",
-  "text_color_rgb": [R, G, B] | null,
-  "background_color_rgb": [R, G, B] | null,
-  "scene_description": "<one sentence describing where/what the text is>",
-  "confidence": "high" | "medium" | "low"
-}
-
-All bounding box coordinates are FRACTIONS of image width/height (0.0 to 1.0).
-estimated_cap_height_px: height of a typical capital letter in the target text, in pixels.
-"""
+# Text-like object labels Florence-2 commonly returns
+_TEXT_KEYWORDS = [
+    "sign", "text", "label", "poster", "menu", "book", "newspaper",
+    "package", "screen", "display", "board", "banner", "notice",
+    "bottle", "box", "can", "container", "magazine", "page",
+]
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+def refine_mask_with_sam(image_np: np.ndarray, bbox_frac: list[float], **kwargs):
+    """
+    Fallback stub for SAM mask refinement when SAM is disabled or not imported.
+    Returns None to fallback to standard bounding-box cropping.
+    """
+    return None
+
+
+def _is_text_region(label: str) -> bool:
+    lbl = label.lower()
+    return any(k in lbl for k in _TEXT_KEYWORDS)
+
+
+def _dominant_color(img_crop: Image.Image, region: str = "all") -> list[int]:
+    """Return median RGB of a crop (robust to outliers)."""
+    arr = np.array(img_crop.convert("RGB"))
+    if region == "border":
+        # Sample from edges — likely background
+        h, w = arr.shape[:2]
+        border = np.concatenate([
+            arr[:5, :].reshape(-1, 3),
+            arr[-5:, :].reshape(-1, 3),
+            arr[:, :5].reshape(-1, 3),
+            arr[:, -5:].reshape(-1, 3),
+        ])
+        return np.median(border, axis=0).astype(int).tolist()
+    return np.median(arr.reshape(-1, 3), axis=0).astype(int).tolist()
+
+
+def _estimate_cap_height(ocr_regions: list[dict], target_bbox_frac: list[float],
+                          img_size: tuple) -> float | None:
+    """
+    Estimate capital letter height in pixels from OCR regions that fall
+    inside the target bbox.
+    """
+    W, H = img_size
+    tx1, ty1, tx2, ty2 = target_bbox_frac
+    heights = []
+    for r in ocr_regions:
+        rx1, ry1, rx2, ry2 = r["bbox_frac"]
+        # Check overlap with target bbox
+        if rx1 >= tx1 and rx2 <= tx2 and ry1 >= ty1 and ry2 <= ty2:
+            heights.append(r["height_px"])
+    if heights:
+        return round(float(np.median(heights)), 1)
+    return None
+
 
 def process_image(
     response_id: str,
@@ -76,77 +75,138 @@ def process_image(
     crops_dir: Path,
     card_bbox_frac: list[float] | None = None,
 ) -> dict:
-    """
-    Run Stage 3 for a single image.
-    card_bbox_frac: from Stage 2 — used to mask out card region if needed.
-    Returns result dict for pipeline dataframe.
-    """
     result = {
-        "response_id": response_id,
-        "target_found": False,
-        "target_bbox": None,
-        "text_content": None,
-        "text_readable": None,
-        "text_theme": None,
-        "cap_height_px": None,
+        "response_id":          response_id,
+        "target_found":         False,
+        "target_bbox":          None,
+        "text_content":         None,
+        "text_readable":        None,
+        "text_theme":           None,
+        "cap_height_px":        None,
         "background_luminance": None,
-        "text_luminance": None,
-        "text_color_rgb": None,
+        "text_luminance":       None,
+        "text_color_rgb":       None,
         "background_color_rgb": None,
-        "scene_description": None,
-        "target_confidence": None,
-        "stage3_flags": [],
+        "scene_description":    None,
+        "target_confidence":    None,
+        "stage3_flags":         [],
     }
 
-    gemini_out = _call_gemini(image_path, TARGET_PROMPT, TARGET_SYSTEM)
-    if gemini_out is None:
-        result["stage3_flags"].append("gemini_failed")
-        return result
+    img = Image.open(image_path).convert("RGB")
+    W, H = img.size
 
-    result["target_found"]       = gemini_out.get("target_found", False)
-    result["target_bbox"]        = gemini_out.get("target_bbox")
-    result["text_content"]       = gemini_out.get("text_content")
-    result["text_readable"]      = gemini_out.get("text_readable", False)
-    result["text_theme"]         = gemini_out.get("text_theme")
-    result["cap_height_px"]      = gemini_out.get("estimated_cap_height_px")
-    result["background_luminance"] = gemini_out.get("background_luminance")
-    result["text_luminance"]     = gemini_out.get("text_luminance")
-    result["text_color_rgb"]     = gemini_out.get("text_color_rgb")
-    result["background_color_rgb"] = gemini_out.get("background_color_rgb")
-    result["scene_description"]  = gemini_out.get("scene_description")
-    result["target_confidence"]  = gemini_out.get("confidence", "low")
+    # ── Find target text region ───────────────────────────────────────────────
+    target_bbox = None
+    confidence = "low"
+    theme = "other"
 
-    if not result["target_found"]:
+    # 1. Try open-vocabulary detection for common text carriers
+    for query, t in [
+        ("sign with text", "signage"),
+        ("text on wall", "signage"),
+        ("food label", "packaging"),
+        ("product packaging", "packaging"),
+        ("menu board", "signage"),
+        ("digital screen with text", "digital_screen"),
+        ("printed text", "print_media"),
+        ("newspaper", "print_media"),
+    ]:
+        hits = detect_object(img, query)
+        for h in hits:
+            bx1, by1, bx2, by2 = h["bbox_frac"]
+            # Must not overlap heavily with the reference card
+            if card_bbox_frac:
+                cx1, cy1, cx2, cy2 = card_bbox_frac
+                overlap_x = max(0, min(bx2, cx2) - max(bx1, cx1))
+                overlap_y = max(0, min(by2, cy2) - max(by1, cy1))
+                overlap_area = overlap_x * overlap_y
+                target_area = (bx2 - bx1) * (by2 - by1)
+                if target_area > 0 and overlap_area / target_area > 0.5:
+                    continue  # skip — mostly overlaps the card
+            target_bbox = h["bbox_frac"]
+            theme = t
+            confidence = "medium"
+            break
+        if target_bbox:
+            break
+
+    # 2. Fallback: dense caption — pick largest non-card region with text label
+    if target_bbox is None:
+        regions = dense_caption(img)
+        for r in regions:
+            if not _is_text_region(r["label"]):
+                continue
+            bx1, by1, bx2, by2 = r["bbox_frac"]
+            if card_bbox_frac:
+                cx1, cy1, cx2, cy2 = card_bbox_frac
+                overlap_x = max(0, min(bx2, cx2) - max(bx1, cx1))
+                overlap_y = max(0, min(by2, cy2) - max(by1, cy1))
+                overlap_area = overlap_x * overlap_y
+                target_area = (bx2 - bx1) * (by2 - by1)
+                if target_area > 0 and overlap_area / target_area > 0.5:
+                    continue
+            target_bbox = r["bbox_frac"]
+            confidence = "low"
+            break
+
+    if target_bbox is None:
         result["stage3_flags"].append("target_not_found")
         return result
 
-    if result["target_confidence"] == "low":
-        result["stage3_flags"].append("low_confidence")
+    result["target_found"]      = True
+    result["target_bbox"]       = target_bbox
+    result["target_confidence"] = confidence
+    result["text_theme"]        = theme
 
+    # ── OCR on full image, estimate cap height ────────────────────────────────
+    ocr_regions = ocr_with_regions(img)
+    result["cap_height_px"] = _estimate_cap_height(ocr_regions, target_bbox, (W, H))
+
+    # Collect text content from OCR regions inside target bbox
+    tx1, ty1, tx2, ty2 = target_bbox
+    texts = [
+        r["text"] for r in ocr_regions
+        if (r["bbox_frac"][0] >= tx1 - 0.05 and r["bbox_frac"][2] <= tx2 + 0.05
+            and r["bbox_frac"][1] >= ty1 - 0.05 and r["bbox_frac"][3] <= ty2 + 0.05)
+    ]
+    result["text_content"]  = " ".join(texts)[:300] if texts else None
+    result["text_readable"] = bool(texts)
+
+    # ── Color analysis from crop ──────────────────────────────────────────────
+    target_crop = bbox_crop(img, target_bbox)
+    bg_rgb   = _dominant_color(target_crop, region="border")
+    text_rgb = _dominant_color(target_crop, region="all")
+
+    result["background_color_rgb"] = bg_rgb
+    result["text_color_rgb"]       = text_rgb
+
+    bg_lum   = 0.2126*bg_rgb[0] + 0.7152*bg_rgb[1] + 0.0722*bg_rgb[2]
+    text_lum = 0.2126*text_rgb[0] + 0.7152*text_rgb[1] + 0.0722*text_rgb[2]
+    result["background_luminance"] = "light" if bg_lum > 127 else "dark"
+    result["text_luminance"]       = "light" if text_lum > 127 else "dark"
+
+    # ── Scene description ─────────────────────────────────────────────────────
+    result["scene_description"] = caption(img)
+
+    if confidence == "low":
+        result["stage3_flags"].append("low_confidence")
     if not result["text_readable"]:
         result["stage3_flags"].append("text_unreadable")
-        # Still valid — participant intentionally photographed hard-to-read text
 
     # ── Save target crop ──────────────────────────────────────────────────────
-    if result["target_bbox"]:
-        img = Image.open(image_path)
-        try:
-            # Attempt SAM refinement (returns None if SAM unavailable)
-            img_np = np.array(img)
-            sam_mask = refine_mask_with_sam(img_np, result["target_bbox"])
-
-            if sam_mask is not None:
-                # Apply mask: zero out non-target pixels
-                masked = img_np.copy()
-                masked[~sam_mask] = 255
-                target_img = Image.fromarray(masked)
-            else:
-                target_img = bbox_crop(img, result["target_bbox"])
-
-            crops_dir.mkdir(parents=True, exist_ok=True)
-            target_img.save(crops_dir / f"{response_id}_target.jpg")
-        except Exception as e:
-            log.warning(f"{response_id}: crop save failed — {e}")
-            result["stage3_flags"].append("crop_save_failed")
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        img_np = np.array(img)
+        sam_mask = refine_mask_with_sam(img_np, target_bbox)
+        if sam_mask is not None:
+            masked = img_np.copy()
+            masked[~sam_mask] = 255
+            target_img = Image.fromarray(masked)
+        else:
+            target_img = target_crop
+        target_img.save(crops_dir / f"{response_id}_target.jpg")
+    except Exception as e:
+        log.warning(f"{response_id}: crop save failed — {e}")
+        result["stage3_flags"].append("crop_save_failed")
 
     return result

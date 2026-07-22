@@ -6,8 +6,8 @@ Generates a multi-page PDF + individual PNGs covering:
   2. Theme distribution
   3. Reading experience ratings by theme
   4. Visual angle & logMAR distributions
-  5. WCAG contrast ratio distribution + compliance
-  6. Contrast vs. legibility
+  5. Michelson & RMS contrast distributions
+  6. Michelson contrast vs. legibility
   7. Text size vs. readability
   8. Pixel-level contrast metrics
   9. Participant submission frequency
@@ -37,9 +37,9 @@ THEME_COLORS = {
     "Strain Saturday":     "#FF9800",
     "Other":               "#9E9E9E",
 }
-WCAG_GREEN  = "#4CAF50"
-WCAG_RED    = "#F44336"
-WCAG_YELLOW = "#FFC107"
+GREEN  = "#4CAF50"
+RED    = "#F44336"
+YELLOW = "#FFC107"
 
 def theme_short(t):
     if pd.isna(t): return "Other"
@@ -175,60 +175,56 @@ save(fig, "04_visual_angle_logmar")
 plt.close()
 
 # =============================================================================
-# 5. WCAG CONTRAST RATIO DISTRIBUTION + COMPLIANCE
+# 5. CONTRAST DISTRIBUTIONS (Michelson & RMS)
 # =============================================================================
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-wcag = df_metrics["wcag_contrast_ratio"].dropna()
-n, bins, patches = axes[0].hist(wcag, bins=14, edgecolor="white")
+michelson = df_metrics["michelson_contrast"].dropna()
+n, bins, patches = axes[0].hist(michelson, bins=14, edgecolor="white")
 for patch, left in zip(patches, bins):
-    if left < 3.0:   patch.set_facecolor(WCAG_RED)
-    elif left < 4.5: patch.set_facecolor(WCAG_YELLOW)
-    else:            patch.set_facecolor(WCAG_GREEN)
-axes[0].axvline(3.0, color="orange", linestyle="--", linewidth=1.5, label="AA Large (3:1)")
-axes[0].axvline(4.5, color="green",  linestyle="--", linewidth=1.5, label="AA Normal (4.5:1)")
-axes[0].axvline(7.0, color="blue",   linestyle="--", linewidth=1.5, label="AAA (7:1)")
-axes[0].set_xlabel("WCAG Contrast Ratio")
+    if left < 0.3:   patch.set_facecolor(RED)
+    elif left < 0.6: patch.set_facecolor(YELLOW)
+    else:            patch.set_facecolor(GREEN)
+axes[0].axvline(0.3, color="orange", linestyle="--", linewidth=1.5, label="0.3 (low contrast)")
+axes[0].axvline(0.6, color="green",  linestyle="--", linewidth=1.5, label="0.6 (good contrast)")
+axes[0].set_xlabel("Michelson Contrast")
 axes[0].set_ylabel("Count")
-axes[0].set_title("Contrast Ratio Distribution", fontweight="bold")
+axes[0].set_title("Michelson Contrast Distribution", fontweight="bold")
 axes[0].legend(fontsize=8)
 axes[0].spines[["top", "right"]].set_visible(False)
 
-compliance = {
-    "AA Large\n(≥3:1)":   df_metrics["wcag_aa_large"].sum(),
-    "AA Normal\n(≥4.5:1)":df_metrics["wcag_aa_normal"].sum(),
-    "AAA Normal\n(≥7:1)": df_metrics["wcag_aaa_normal"].sum(),
-}
-total = len(df_metrics["wcag_contrast_ratio"].dropna())
-clrs2 = [WCAG_YELLOW, WCAG_GREEN, "#1565C0"]
-bars = axes[1].bar(compliance.keys(), compliance.values(), color=clrs2, edgecolor="white")
+rms = df_metrics["rms_contrast"].dropna()
+n2, bins2, patches2 = axes[1].hist(rms, bins=14, edgecolor="white")
+for patch, left in zip(patches2, bins2):
+    if left < 0.15:  patch.set_facecolor(RED)
+    elif left < 0.3: patch.set_facecolor(YELLOW)
+    else:            patch.set_facecolor(GREEN)
+axes[1].axvline(0.15, color="orange", linestyle="--", linewidth=1.5, label="0.15 (low variability)")
+axes[1].axvline(0.3,  color="green",  linestyle="--", linewidth=1.5, label="0.3 (good variability)")
+axes[1].set_xlabel("RMS Contrast")
 axes[1].set_ylabel("Count")
-axes[1].set_ylim(0, total + 3)
-axes[1].set_title(f"WCAG Compliance (n={total})", fontweight="bold")
+axes[1].set_title("RMS Contrast Distribution", fontweight="bold")
+axes[1].legend(fontsize=8)
 axes[1].spines[["top", "right"]].set_visible(False)
-for bar, val in zip(bars, compliance.values()):
-    pct = val / total * 100
-    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                 f"{val} ({pct:.0f}%)", ha="center", fontweight="bold")
 
-fig.suptitle("Contrast & Accessibility", fontsize=14, fontweight="bold")
+fig.suptitle("Pixel-Level Contrast Distributions", fontsize=14, fontweight="bold")
 fig.tight_layout()
-save(fig, "05_wcag_contrast")
+save(fig, "05_contrast_distributions")
 plt.close()
 
 # =============================================================================
-# 6. CONTRAST RATIO vs. LEGIBILITY (scatter)
+# 6. MICHELSON CONTRAST vs. LEGIBILITY (scatter)
 # =============================================================================
 fig, ax = plt.subplots(figsize=(8, 5))
-plot_df = df_metrics[df_metrics["wcag_contrast_ratio"].notna() & df_metrics["legible"].notna()].copy()
-for legible, color, label in [(True, WCAG_GREEN, "Legible"), (False, WCAG_RED, "Not legible")]:
+plot_df = df_metrics[df_metrics["michelson_contrast"].notna() & df_metrics["legible"].notna()].copy()
+for legible, color, label in [(True, GREEN, "Legible"), (False, RED, "Not legible")]:
     sub = plot_df[plot_df["legible"] == legible]
-    ax.scatter(sub["wcag_contrast_ratio"], sub["visual_angle_deg"],
+    ax.scatter(sub["michelson_contrast"], sub["visual_angle_deg"],
                c=color, label=label, alpha=0.75, s=80, edgecolors="white")
-ax.axvline(4.5, color="gray", linestyle="--", linewidth=1, label="WCAG AA (4.5:1)")
-ax.set_xlabel("WCAG Contrast Ratio")
+ax.axvline(0.3, color="gray", linestyle="--", linewidth=1, label="Michelson 0.3 (low contrast)")
+ax.set_xlabel("Michelson Contrast")
 ax.set_ylabel("Visual Angle (degrees)")
-ax.set_title("Contrast Ratio vs. Visual Angle\ncolored by Legibility", fontsize=13, fontweight="bold")
+ax.set_title("Michelson Contrast vs. Visual Angle\ncolored by Legibility", fontsize=13, fontweight="bold")
 ax.legend()
 ax.spines[["top", "right"]].set_visible(False)
 fig.tight_layout()
@@ -250,7 +246,7 @@ for ax, col, title in [
     if groups:
         bp = ax.boxplot(groups.values(), tick_labels=groups.keys(), patch_artist=True,
                         medianprops={"color": "black", "linewidth": 2})
-        for patch, color in zip(bp["boxes"], [WCAG_GREEN, WCAG_RED]):
+        for patch, color in zip(bp["boxes"], [GREEN, RED]):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
     ax.set_ylabel("Visual Angle (degrees)")
@@ -328,7 +324,7 @@ quality = {
     "Target\nfound":       int(df["target_found"].sum()),
     "Full\nmetrics":       int(df["visual_angle_deg"].notna().sum()),
 }
-colors = [WCAG_RED, WCAG_YELLOW, WCAG_GREEN, "#42A5F5", "#1565C0"]
+colors = [RED, YELLOW, GREEN, "#42A5F5", "#1565C0"]
 bars = ax.bar(quality.keys(), quality.values(), color=colors, edgecolor="white")
 ax.set_ylabel("Count")
 ax.set_title("Data Quality Breakdown (38 image submissions)", fontsize=13, fontweight="bold")
