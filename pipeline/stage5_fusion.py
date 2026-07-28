@@ -26,6 +26,95 @@ from stage1_cleaning import (
 
 log = logging.getLogger(__name__)
 
+"""
+pipeline/stage5_fusion.py
+=========================
+Annotates bounding boxes on image and appends an extended bottom metrics banner.
+"""
+
+import cv2
+import numpy as np
+
+def generate_annotated_dashboard(
+    image_np: np.ndarray,
+    card_info: dict,
+    text_metrics: list[dict],
+    survey_data: dict
+) -> np.ndarray:
+    """
+    Creates an annotated image with a bottom banner displaying survey data and metrics.
+    """
+    img = image_np.copy()
+    H, W = img.shape[:2]
+
+    # 1. Annotate Reference Card (Green Box + Confidence)
+    if card_info.get("card_found") and card_info.get("bbox"):
+        cx1, cy1, cx2, cy2 = card_info["bbox"]
+        conf = card_info.get("confidence", 0.0)
+        cv2.rectangle(img, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
+        cv2.putText(
+            img, f"Ref Card (Conf: {conf:.2f})", (cx1, max(cy1 - 8, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2
+        )
+
+    # 2. Annotate Text Boxes (Cyan Boxes + Labels)
+    for t in text_metrics:
+        tx1, ty1, tx2, ty2 = t["bbox"]
+        label = t["label"]
+        cv2.rectangle(img, (tx1, ty1), (tx2, ty2), (255, 255, 0), 2)
+        cv2.putText(
+            img, label, (tx1, max(ty1 - 5, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1
+        )
+
+    # 3. Create Extended Bottom Banner
+    banner_height = 220 + (len(text_metrics) * 22)
+    banner = np.ones((banner_height, W, 3), dtype=np.uint8) * 245  # Light gray background
+
+    # Divider line
+    cv2.line(banner, (0, 5), (W, 5), (50, 50, 50), 2)
+
+    # Render Survey Details
+    y_offset = 30
+    cv2.putText(banner, "--- SURVEY RESPONSES ---", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 150), 2)
+    y_offset += 25
+    
+    theme = survey_data.get("theme", "N/A")
+    yn1 = survey_data.get("readable_yn", "N/A")
+    yn2 = survey_data.get("lighting_yn", "N/A")
+    yn3 = survey_data.get("clear_bg_yn", "N/A")
+    open_ans = survey_data.get("open_ended_response", "N/A")
+
+    cv2.putText(banner, f"Theme: {theme}", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    y_offset += 20
+    cv2.putText(banner, f"Yes/No Qs -> Readable: {yn1} | Good Lighting: {yn2} | Clear BG: {yn3}", 
+                (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    y_offset += 20
+    cv2.putText(banner, f"Open Answer: {open_ans[:80]}", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
+    # Render Calculated Metrics
+    y_offset += 30
+    cv2.putText(banner, "--- CALCULATED METRICS ---", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 0, 0), 2)
+    y_offset += 25
+
+    ref_h_px = card_info.get("card_height_px", "N/A")
+    cv2.putText(banner, f"Ref Card Height (px): {ref_h_px} | Conf: {card_info.get('confidence')}", 
+                (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    y_offset += 22
+
+    for t in text_metrics:
+        lbl = t["label"]
+        v_ang = t.get("visual_angle_deg", "N/A")
+        rel_ratio = t.get("relative_visual_angle_ratio", "N/A")
+        contrast = t.get("michelson_contrast", "N/A")
+
+        text_str = f"{lbl} -> Visual Angle: {v_ang} deg | Rel Angle Ratio: {rel_ratio} | Contrast: {contrast}"
+        cv2.putText(banner, text_str, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 30), 1)
+        y_offset += 20
+
+    # Stack original image and bottom banner together
+    combined_img = np.vstack([img, banner])
+    return combined_img
 
 # ── Survey column rename map ──────────────────────────────────────────────────
 # Maps long Qualtrics column names → short analysis-friendly names
