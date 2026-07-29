@@ -101,9 +101,8 @@ def detect_faces_dnn(img_bgr: np.ndarray) -> list[tuple]:
 
 def detect_plates_heuristic(img_bgr: np.ndarray) -> list[tuple]:
     """
-    Heuristic license plate detector using contour aspect ratio.
-    Flags rectangles with aspect ratio ~2:1 to 5:1 and moderate area.
-    Not perfect — errs on the side of over-blurring.
+    Heuristic license plate detector using contour aspect ratio and density.
+    Refined to avoid blurring target text and calibration bars.
     """
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -114,12 +113,24 @@ def detect_plates_heuristic(img_bgr: np.ndarray) -> list[tuple]:
     boxes = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if h == 0:
+        if h == 0 or w == 0:
             continue
+
         aspect = w / h
         area_frac = (w * h) / (W * H)
-        if 1.5 < aspect < 6.0 and 0.002 < area_frac < 0.05:
-            boxes.append((x, y, x + w, y + h))
+
+        # Real license plates usually have high edge density and specific aspect ratios (~2:1 to 3.5:1)
+        # Avoid aspects > 4.0 which frequently collide with text lines and calibration bars
+        if 2.0 < aspect < 4.0 and 0.005 < area_frac < 0.04:
+            # Check edge density inside region
+            roi_edges = edges[y:y+h, x:x+w]
+            edge_density = np.count_nonzero(roi_edges) / (w * h)
+
+            # License plates have dense characters inside (high edge density)
+            # Solid bars have low edge density inside
+            if 0.12 < edge_density < 0.45:
+                boxes.append((x, y, x + w, y + h))
+
     return boxes
 
 

@@ -1,24 +1,14 @@
 """
 Wicked Words Pipeline — Main Runner
 =====================================
-Stage 0 : De-identification  — blur faces/plates in images, strip PII from CSV
+Stage 0 : De-identification  — blur faces/plates in images, strip PII from CSV (Skipped for raw processing)
 Stage 1 : Data cleaning      — filter invalid submissions, assign participant IDs
-Stage 2 : Ref card detection — Gemini detects calibration card, computes px/cm
-Stage 3 : Target text        — Gemini extracts text region, colors, cap height
-Stage 4 : Metrics            — visual angle, logMAR, contrast, readability predictions
-Stage 5 : Fusion + output    — merge all results, write CSV / parquet
-
-IMPORTANT: Stages 2 and 3 send images to Gemini.
-           They ONLY receive de-identified images from Stage 0 output.
-           Original images never leave the local machine.
-
-Outputs (in outputs/):
-    deidentified/images/          — blurred copies sent to AI
-    deidentified/survey_deidentified.csv
-    results.csv / results.parquet — full merged analytics
-    participant_summary.csv
-    flagged_for_review.csv
-    failed_log_<ts>.csv
+Stage 2 : Ref card detection — Local model detects calibration card, computes px/cm, confidence
+Stage 3 : Multi-target text  — Extracts all text blocks (text1, text2...), calculates relative 
+                               ratios to bar, coordinates [x1, y1, x2, y2], and visual angles
+Stage 4 : Metrics            — Computes logMAR, legibility/readability predictions
+Stage 5 : Fusion + output    — Merges survey responses (Theme, Y/N, open-ended) with 
+                               calculated image/text metrics into CSV / Parquet
 """
 
 import os
@@ -27,6 +17,7 @@ import logging
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+from PIL import Image
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(base_dir, "pipeline"))
@@ -37,7 +28,11 @@ import pipeline.stage2_refcard    as s2
 import pipeline.stage3_target     as s3
 import pipeline.stage4_metrics    as s4
 import pipeline.stage5_fusion     as s5
+# ── IMPORT ANNOTATOR MODULE HERE ──────────────────────────────────────────────
+import pipeline.stage2_stage3_annotator as annotator
+
 from config import IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR, DEIDENT_IMAGE_DIR
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -45,13 +40,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("runner")
 
+# Output directory for annotated full images with survey dashboard banner
+ANNOTATED_DIR = OUTPUTS_DIR / "annotated_images"
+
 
 def run(csv_path: Path, image_dir: Path, limit: int | None = None):
     log.info("=" * 60)
     log.info("Wicked Words Pipeline starting")
     log.info("=" * 60)
 
-    # ── Stage 1: Clean CSV ────────────────────────────────────────────────────
+    # ── Stage 1: Data cleaning ────────────────────────────────────────────────
     log.info("\n── Stage 1: Data cleaning ──")
     df_raw = s1.load_csv(csv_path)
     cleaning = s1.clean(df_raw, image_dir)
@@ -63,15 +61,11 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
         log.info(f"Running on first {limit} rows (--limit flag)")
     log.info(f"Processing {len(df_clean)} image rows")
 
-    # ── Stage 0: De-identification ────────────────────────────────────────────
-    # Must run BEFORE any image is sent to an AI service.
-    # Uses original image_dir as source; writes blurred copies to deidentified/.
-    log.info("\n── Stage 0: De-identification (privacy firewall) ──")
-    deident = s0.run(df_raw, image_dir)
-    deident_image_dir = deident["deident_image_dir"]
-    log.info(f"  AI will use images from: {deident_image_dir}")
+    # Raw image directory (skipping Stage 0 de-identification)
+    deident_image_dir = IMAGE_DIR
+    ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Stages 2–4: Per-image processing (using de-identified images) ─────────
+    # ── Stages 2–4: Per-image processing ──────────────────────────────────────
     stage2_results = []
     stage3_results = []
     stage4_results = []
@@ -79,35 +73,91 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
     for _, row in tqdm(df_clean.iterrows(), total=len(df_clean), desc="Processing images"):
         rid = str(row.get(s1.COL_RESPONSE_ID, ""))
 
-        # Always resolve image path from de-identified folder
+        # Resolve image path
         deident_path = s1.get_image_path(rid, deident_image_dir)
         if deident_path is None:
-            log.warning(f"{rid}: de-identified image not found — skipping")
+            log.warning(f"{rid}: image not found — skipping")
             continue
 
-        # Stage 2: Reference card (uses de-identified image)
+        # Stage 2: Reference card detection & calibration
         r2 = s2.process_image(rid, deident_path, CROPS_DIR)
         stage2_results.append(r2)
 
         if r2.get("privacy_flag"):
-            log.warning(f"{rid}: residual privacy flag after de-identification — skipping stages 3+4")
-            continue
-        if not r2.get("card_found"):
-            log.info(f"{rid}: card not found — skipping stages 3+4")
+            log.warning(f"{rid}: residual privacy flag — skipping stages 3+4")
             continue
 
-        # Stage 3: Target text (uses de-identified image)
-        r3 = s3.process_image(rid, deident_path, CROPS_DIR, card_bbox_frac=r2.get("card_bbox"))
+        # Extract calibration metrics if card was found
+        px_per_cm = r2.get("px_per_cm") if r2.get("card_found") else None
+        card_bbox = r2.get("card_bbox") if r2.get("card_found") else None
+
+        # Resolve viewing distance
+        raw_dist = row.get("distance_cm") or row.get("distance_ft")
+        try:
+            distance_cm = float(raw_dist) if raw_dist else None
+            if distance_cm and "distance_ft" in row and row.get("distance_ft"):
+                distance_cm = distance_cm * 30.48
+        except (ValueError, TypeError):
+            distance_cm = None
+
+        # Stage 3: Multi-target text extraction
+        r3 = s3.process_image(
+            response_id=rid,
+            image_path=deident_path,
+            crops_dir=CROPS_DIR,
+            px_per_cm=px_per_cm,
+            distance_cm=distance_cm,
+            card_bbox_frac=card_bbox,
+        )
         stage3_results.append(r3)
 
+        # ── ANNOTATION & DASHBOARD BANNER GENERATION ─────────────────────────
+        try:
+            raw_img = Image.open(deident_path).convert("RGB")
+            W, H = raw_img.size
+
+            # Format text blocks from Stage 3 for the annotator
+            annot_text_blocks = []
+            bar_px = r2.get("bar_width_px") or r2.get("corrected_bar_px") or 1.0
+
+            for t in r3.get("text_blocks", []):
+                # Ensure bounding box is in pixel tuple format [x1, y1, x2, y2]
+                if "bbox_frac" in t:
+                    bx1, by1, bx2, by2 = t["bbox_frac"]
+                    bbox_px = (int(bx1 * W), int(by1 * H), int(bx2 * W), int(by2 * H))
+                else:
+                    bbox_px = tuple(t.get("bbox_px", (0, 0, 0, 0)))
+
+                metrics = annotator.compute_visual_metrics(bbox_px, bar_height_px=bar_px, px_per_cm=px_per_cm)
+                contrast = annotator.compute_contrast(s2.np.array(raw_img), bbox_px)
+
+                annot_text_blocks.append({
+                    "bbox_px": bbox_px,
+                    "contrast": contrast,
+                    **metrics
+                })
+
+            # Save full annotated image with dashboard banner (Uncropped)
+            annotated_out_path = ANNOTATED_DIR / f"{rid}_annotated.jpg"
+            annotator.draw_annotations_and_dashboard(
+                image=raw_img,
+                card_info=r2,
+                text_regions=annot_text_blocks,
+                survey_data=dict(row),  # Pass complete survey row dictionary
+                output_path=annotated_out_path
+            )
+        except Exception as e:
+            log.warning(f"{rid}: Image annotation failed — {e}")
+        # ─────────────────────────────────────────────────────────────────────
+
         if not r3.get("target_found"):
-            log.info(f"{rid}: target not found — skipping stage 4")
+            log.info(f"{rid}: target text not found — skipping stage 4")
             continue
 
-        # Stage 4: Metrics + predictions (local computation, no AI)
+        # Stage 4: Metrics computation per block
         r4 = s4.compute_all_metrics(
             response_id=rid,
-            cap_height_px=r3.get("cap_height_px"),
+            text_blocks=r3.get("text_blocks", []),
             px_per_cm=r2.get("px_per_cm"),
             calib_bar_px=r2.get("corrected_bar_px"),
             crops_dir=CROPS_DIR,
@@ -119,7 +169,7 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
     log.info(f"  Stage 3 processed : {len(stage3_results)}")
     log.info(f"  Stage 4 processed : {len(stage4_results)}")
 
-    # ── Stage 5: Merge + save ─────────────────────────────────────────────────
+    # ── Stage 5: Survey fusion + output ───────────────────────────────────────
     log.info("\n── Stage 5: Survey fusion + output ──")
     df_merged = s5.merge(df_clean, stage2_results, stage3_results, stage4_results)
     s5.save_outputs(df_merged, OUTPUTS_DIR)
@@ -127,6 +177,7 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
     log.info("\n" + "=" * 60)
     log.info("Pipeline complete.")
     log.info(f"Results in: {OUTPUTS_DIR}")
+    log.info(f"Annotated images saved to: {ANNOTATED_DIR}")
     log.info("=" * 60)
     return df_merged
 
