@@ -60,22 +60,10 @@ def snellen_from_logmar(logmar: float) -> str:
     return f"20/{min(standards, key=lambda s: abs(s - denom))}"
 
 
-def visual_angle_calib_multiples(cap_height_px: float, calib_bar_px: float) -> float:
-    """
-    Express text cap-height as a multiple of the calibration bar width.
-    e.g. 0.05 means the text cap-height is 5% of the calibration bar.
-    This is scale-invariant — independent of viewing distance or px/cm.
-    """
-    if calib_bar_px is None or calib_bar_px <= 0:
-        return None
-    return round(cap_height_px / calib_bar_px, 4)
-
-
-def compute_size_metrics(cap_height_px: float, px_per_cm: float,
-                         calib_bar_px: float | None = None) -> dict:
+def compute_size_metrics(cap_height_px: float, px_per_cm: float) -> dict:
     if cap_height_px is None or px_per_cm is None or px_per_cm <= 0:
         return {"visual_angle_deg": None, "logmar": None, "snellen_equiv": None,
-                "cap_height_cm": None, "visual_angle_calib_multiples": None}
+                "cap_height_cm": None}
     va = visual_angle_deg(cap_height_px, px_per_cm)
     lm = logmar_from_deg(va)
     return {
@@ -83,7 +71,6 @@ def compute_size_metrics(cap_height_px: float, px_per_cm: float,
         "logmar": lm,
         "snellen_equiv": snellen_from_logmar(lm),
         "cap_height_cm": round(cap_height_px / px_per_cm, 3),
-        "visual_angle_calib_multiples": visual_angle_calib_multiples(cap_height_px, calib_bar_px),
     }
 
 
@@ -203,11 +190,13 @@ def compute_all_metrics(
     response_id: str,
     cap_height_px: float | None,
     px_per_cm: float | None,
-    calib_bar_px: float | None,
+    text_rgb: list | None,
+    bg_rgb: list | None,
     crops_dir: Path,
 ) -> dict:
-    size           = compute_size_metrics(cap_height_px, px_per_cm, calib_bar_px)
+    size           = compute_size_metrics(cap_height_px, px_per_cm)
     pixel_contrast = compute_pixel_contrast(crops_dir / f"{response_id}_target.jpg")
+    color_contrast = compute_color_contrast(text_rgb, bg_rgb)
     predictions    = predict_human_behavior(
         visual_angle=size.get("visual_angle_deg"),
         logmar=size.get("logmar"),

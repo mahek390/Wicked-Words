@@ -99,37 +99,51 @@ def _find_bar_in_strip(card_np: np.ndarray, strip: str) -> dict | None:
     if strip == "top":
         region = card_np[:strip_h, :]
         y_offset = 0
-    else:   # bottom
+    else:
         region = card_np[H - strip_h:, :]
         y_offset = H - strip_h
 
     gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
-    _, thresh = cv2.threshold(gray, _BAR_LUMINANCE_THRESH, 255, cv2.THRESH_BINARY_INV)
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find the single darkest row — that is the bar centre
+    row_means = gray.mean(axis=1)
+    bar_row = int(np.argmin(row_means))
 
-    best, best_score = None, 0
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if h < 2 or w < _BAR_MIN_WIDTH_FRAC * W:
-            continue
-        aspect = w / h
-        if aspect < _BAR_MIN_ASPECT:
-            continue
-        score = aspect * (w / W)
-        if score > best_score:
-            best_score = score
-            best = {
-                "bar_width_px": float(w),
-                "bar_height_px": float(h),
-                "local_x1": x,
-                "local_y1": y + y_offset,
-                "local_x2": x + w,
-                "local_y2": y + y_offset + h,
-                "strip": strip,
-                "aspect": round(aspect, 2),
-            }
-    return best
+    # Expand outward from bar_row while rows stay dark
+    threshold = min(row_means[bar_row] * 3.0, _BAR_LUMINANCE_THRESH)
+    top_row = bar_row
+    while top_row > 0 and row_means[top_row - 1] < threshold:
+        top_row -= 1
+    bot_row = bar_row
+    while bot_row < len(row_means) - 1 and row_means[bot_row + 1] < threshold:
+        bot_row += 1
+
+    bar_h = bot_row - top_row + 1
+
+    # Find horizontal extent: columns where the bar row is dark
+    bar_slice = gray[top_row:bot_row + 1, :]
+    col_means = bar_slice.mean(axis=0)
+    dark_cols = np.where(col_means < threshold)[0]
+    if len(dark_cols) < _BAR_MIN_WIDTH_FRAC * W:
+        return None
+
+    x_start, x_end = int(dark_cols[0]), int(dark_cols[-1])
+    bar_w = x_end - x_start + 1
+    aspect = bar_w / max(bar_h, 1)
+
+    if aspect < _BAR_MIN_ASPECT:
+        return None
+
+    return {
+        "bar_width_px":  float(bar_w),
+        "bar_height_px": float(bar_h),
+        "local_x1": x_start,
+        "local_y1": top_row + y_offset,
+        "local_x2": x_end,
+        "local_y2": bot_row + y_offset,
+        "strip": strip,
+        "aspect": round(aspect, 2),
+    }
 
 
 def _detect_calibration_bar(
