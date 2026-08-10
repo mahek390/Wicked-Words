@@ -31,7 +31,10 @@ import pipeline.stage5_fusion     as s5
 # ── IMPORT ANNOTATOR MODULE HERE ──────────────────────────────────────────────
 import pipeline.stage2_stage3_annotator as annotator
 
-from config import IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR, DEIDENT_IMAGE_DIR
+from config import (
+    IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR, DEIDENT_IMAGE_DIR,
+    VIEWING_DISTANCE_CM,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,14 +94,22 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
         px_per_cm = r2.get("px_per_cm") if r2.get("card_found") else None
         card_bbox = r2.get("card_bbox") if r2.get("card_found") else None
 
-        # Resolve viewing distance
-        raw_dist = row.get("distance_cm") or row.get("distance_ft")
+        # Viewing distance: the survey does not collect an actual measured
+        # distance — only the standard distance printed on the reference card
+        # (config.VIEWING_DISTANCE_CM). distance_cm/distance_ft aren't real
+        # survey columns today, but are honored here in case a future survey
+        # version adds either of them.
+        raw_dist_cm = row.get("distance_cm")
+        raw_dist_ft = row.get("distance_ft")
         try:
-            distance_cm = float(raw_dist) if raw_dist else None
-            if distance_cm and "distance_ft" in row and row.get("distance_ft"):
-                distance_cm = distance_cm * 30.48
+            if raw_dist_cm:
+                distance_cm = float(raw_dist_cm)
+            elif raw_dist_ft:
+                distance_cm = float(raw_dist_ft) * 30.48
+            else:
+                distance_cm = VIEWING_DISTANCE_CM
         except (ValueError, TypeError):
-            distance_cm = None
+            distance_cm = VIEWING_DISTANCE_CM
 
         # Stage 3: Multi-target text extraction
         r3 = s3.process_image(
@@ -113,38 +124,14 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
 
         # ── ANNOTATION & DASHBOARD BANNER GENERATION ─────────────────────────
         try:
-            raw_img = Image.open(deident_path).convert("RGB")
-            W, H = raw_img.size
-
-            # Format text blocks from Stage 3 for the annotator
-            annot_text_blocks = []
-            bar_px = r2.get("bar_width_px") or r2.get("corrected_bar_px") or 1.0
-
-            for t in r3.get("text_blocks", []):
-                # Ensure bounding box is in pixel tuple format [x1, y1, x2, y2]
-                if "bbox_frac" in t:
-                    bx1, by1, bx2, by2 = t["bbox_frac"]
-                    bbox_px = (int(bx1 * W), int(by1 * H), int(bx2 * W), int(by2 * H))
-                else:
-                    bbox_px = tuple(t.get("bbox_px", (0, 0, 0, 0)))
-
-                metrics = annotator.compute_visual_metrics(bbox_px, bar_height_px=bar_px, px_per_cm=px_per_cm)
-                contrast = annotator.compute_contrast(s2.np.array(raw_img), bbox_px)
-
-                annot_text_blocks.append({
-                    "bbox_px": bbox_px,
-                    "contrast": contrast,
-                    **metrics
-                })
-
-            # Save full annotated image with dashboard banner (Uncropped)
             annotated_out_path = ANNOTATED_DIR / f"{rid}_annotated.jpg"
-            annotator.draw_annotations_and_dashboard(
-                image=raw_img,
-                card_info=r2,
-                text_regions=annot_text_blocks,
-                survey_data=dict(row),  # Pass complete survey row dictionary
-                output_path=annotated_out_path
+            annotator.process_and_annotate_record(
+                response_id=rid,
+                image_path=deident_path,
+                output_image_path=annotated_out_path,
+                survey_row=dict(row),
+                stage2_card_result=r2,
+                detected_texts_ocr=r3.get("text_blocks", []),
             )
         except Exception as e:
             log.warning(f"{rid}: Image annotation failed — {e}")
@@ -155,12 +142,18 @@ def run(csv_path: Path, image_dir: Path, limit: int | None = None):
             continue
 
         # Stage 4: Metrics computation per block
+        try:
+            raw_img = Image.open(deident_path).convert("RGB")
+        except Exception as e:
+            log.warning(f"{rid}: could not open image for Stage 4 — {e}")
+            raw_img = None
+
         r4 = s4.compute_all_metrics(
             response_id=rid,
             text_blocks=r3.get("text_blocks", []),
             px_per_cm=r2.get("px_per_cm"),
             calib_bar_px=r2.get("corrected_bar_px"),
-            crops_dir=CROPS_DIR,
+            image=raw_img,
         )
         stage4_results.append(r4)
 

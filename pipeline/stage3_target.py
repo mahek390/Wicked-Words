@@ -15,7 +15,6 @@ from PIL import Image
 
 from config import CALIB_BAR_CM
 from local_model import ocr_with_regions
-from stage2_stage3_annotator import process_and_annotate_record
 
 log = logging.getLogger(__name__)
 
@@ -105,30 +104,10 @@ def process_image(
             "relative_ratio_to_bar": relative_ratio_to_bar,
         })
 
-
-    from stage2_stage3_annotator import process_and_annotate_record
-
-    def process_stage3(
-        response_id: str,
-        image_path: Path,
-        output_annotated_path: Path,
-        survey_row: dict,
-        stage2_result: dict,
-        ocr_detections: list[dict]
-    ) -> dict:
-        """
-        Executes Stage 3 processing without cropping, produces annotated image with 
-        dashboard banner, and generates flattened CSV metrics dictionary.
-        """
-        csv_record = process_and_annotate_record(
-            response_id=response_id,
-            image_path=image_path,
-            output_image_path=output_annotated_path,
-            survey_row=survey_row,
-            stage2_card_result=stage2_result,
-            detected_texts_ocr=ocr_detections
-        )
-        
-        return csv_record
+    # A block was actually detected (and survived the card-overlap filter) —
+    # this drives whether Stage 4 metrics get computed downstream.
+    result["target_found"] = len(result["text_blocks"]) > 0
+    if not result["target_found"]:
+        result["stage3_flags"].append("no_text_detected")
 
     return result

@@ -2,9 +2,9 @@
 Stage 2 — Reference Card Detection & Calibration
 ================================================
 Updates:
-- Fixed bbox_crop height calculation bug (y2).
-- Updated _ocr_anchor_gate to use check_ocr_anchors with fuzzy logic and len >= 1.
-- Keeps dictionary clean of raw PIL objects for Parquet compatibility.
+- OCR Spatial Search: Locates '8 cm' / 'this bar' text anchor to lock onto the calibration bar.
+- Orientation Invariance: Rotates card in 90-degree steps to handle rotated photos.
+- Parquet Compatible: Clean return dictionary with no raw PIL image objects.
 """
 
 import math
@@ -28,19 +28,18 @@ _CARD_ANCHORS = [
     "this bar", "bar", "8 cm", "8cm", "challenges", "cm"
 ]
 
-def check_ocr_anchors(ocr_text: str) -> bool:
-    """
-    Relaxed anchor matching to account for OCR noise, blur, or severe angles.
-    Checks substring containment across the whole text string first,
-    then falls back to token-level fuzzy matching (>65% similarity).
-    """
-    text_lower = ocr_text.lower()
+_BAR_MIN_ASPECT = 2.0
+_BAR_MIN_WIDTH_FRAC = 0.15
+_BAR_MAX_HEIGHT_FRAC = 0.15
+_BAR_LUMINANCE_THRESH = 100
 
-    # 1. Direct fast substring check (catches "8cm", "bar", "wicked", etc.)
+
+def check_ocr_anchors(ocr_text: str) -> bool:
+    """Checks for presence of key card vocabulary using substring and fuzzy token matching."""
+    text_lower = ocr_text.lower()
     if any(anchor in text_lower for anchor in _CARD_ANCHORS):
         return True
 
-    # 2. Relaxed fuzzy token matching (>65% similarity)
     words = text_lower.split()
     for anchor in _CARD_ANCHORS:
         if any(difflib.SequenceMatcher(None, anchor, w).ratio() > 0.65 for w in words):
@@ -49,30 +48,18 @@ def check_ocr_anchors(ocr_text: str) -> bool:
     return False
 
 
-# ── Relaxed Bar detection parameters ──────────────────────────────────────────
-_BAR_LUMINANCE_THRESH = 130   # Raised: accepts shadowed/unevenly lit black bars
-_BAR_MIN_ASPECT       = 2.0   # Lowered: accepts angled or foreshortened views
-_BAR_MIN_WIDTH_FRAC   = 0.15  # Accepts smaller card bounding boxes
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def bbox_crop(img: Image.Image, bbox_frac: list[float]) -> Image.Image:
-    """Correctly crops PIL image using fractional bounding box [x1, y1, x2, y2]."""
+    """Crops PIL image using fractional bounding box [x1, y1, x2, y2]."""
     W, H = img.size
     x1, y1, x2, y2 = bbox_frac
     return img.crop((
         max(0, int(x1 * W)), max(0, int(y1 * H)),
-        min(W, int(x2 * W)), min(H, int(y2 * H)), # ✅ Fixed y2 calculation
+        min(W, int(x2 * W)), min(H, int(y2 * H)),
     ))
 
 
-# ── OCR anchor gate ───────────────────────────────────────────────────────────
-
 def _ocr_anchor_gate(img: Image.Image) -> dict:
-    """
-    Run OCR on the full image and check for Wicked Words card vocabulary.
-    Returns {pass: bool, matched: list, ocr_regions: list}.
-    """
+    """Run OCR on full image to verify presence of reference card anchors."""
     try:
         ocr_regions = ocr_with_regions(img)
     except Exception as e:
@@ -81,106 +68,207 @@ def _ocr_anchor_gate(img: Image.Image) -> dict:
 
     full_text = " ".join(r["text"].lower() for r in ocr_regions)
     matched = [a for a in _CARD_ANCHORS if a in full_text]
-    
-    # ✅ FIX: Use check_ocr_anchors() so fuzzy matching & single-token hits pass
     passed = check_ocr_anchors(full_text)
 
-    log.debug(f"OCR gate: passed={passed}, matched direct={matched}")
     return {"pass": passed, "matched": matched, "ocr_regions": ocr_regions}
 
 
-# ── Bar detection (full-width top/bottom strips) ───────────────────────────────
+# ── OCR-Guided Bar Localizer ─────────────────────────────────────────────────
 
-def _find_bar_in_strip(card_np: np.ndarray, strip: str) -> dict | None:
-    """Search for the calibration bar in a horizontal strip of the card."""
+def _find_bar_near_ocr_anchor(card_np: np.ndarray, ocr_regions: list) -> dict | None:
+    """
+    Looks specifically near OCR detections containing '8 cm' or 'this bar'.
+    This guarantees we isolate the calibration bar from other dark lines.
+    """
     H, W = card_np.shape[:2]
-    strip_h = max(4, int(H * 0.20))
+    anchor_box = None
 
-    if strip == "top":
-        region = card_np[:strip_h, :]
-        y_offset = 0
-    else:
-        region = card_np[H - strip_h:, :]
-        y_offset = H - strip_h
+    for r in ocr_regions:
+        txt = r.get("text", "").lower()
+        if "8 cm" in txt or "8cm" in txt or "this bar" in txt:
+            # Found spatial anchor! Convert bounding box coordinates
+            if "bbox_px" in r:
+                anchor_box = r["bbox_px"]
+            elif "bbox_frac" in r:
+                ax1, ay1, ax2, ay2 = r["bbox_frac"]
+                anchor_box = (int(ax1 * W), int(ay1 * H), int(ax2 * W), int(ay2 * H))
+            break
 
-    gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
-
-    # Find the single darkest row — that is the bar centre
-    row_means = gray.mean(axis=1)
-    bar_row = int(np.argmin(row_means))
-
-    # Expand outward from bar_row while rows stay dark
-    threshold = min(row_means[bar_row] * 3.0, _BAR_LUMINANCE_THRESH)
-    top_row = bar_row
-    while top_row > 0 and row_means[top_row - 1] < threshold:
-        top_row -= 1
-    bot_row = bar_row
-    while bot_row < len(row_means) - 1 and row_means[bot_row + 1] < threshold:
-        bot_row += 1
-
-    bar_h = bot_row - top_row + 1
-
-    # Find horizontal extent: columns where the bar row is dark
-    bar_slice = gray[top_row:bot_row + 1, :]
-    col_means = bar_slice.mean(axis=0)
-    dark_cols = np.where(col_means < threshold)[0]
-    if len(dark_cols) < _BAR_MIN_WIDTH_FRAC * W:
+    if not anchor_box:
         return None
 
-    x_start, x_end = int(dark_cols[0]), int(dark_cols[-1])
-    bar_w = x_end - x_start + 1
-    aspect = bar_w / max(bar_h, 1)
+    # Search in a region expanded around the text label (above/below/adjacent)
+    ax1, ay1, ax2, ay2 = anchor_box
+    search_y1 = max(0, ay1 - int(0.15 * H))
+    search_y2 = min(H, ay2 + int(0.15 * H))
+    search_x1 = max(0, ax1 - int(0.10 * W))
+    search_x2 = min(W, ax2 + int(0.10 * W))
 
-    if aspect < _BAR_MIN_ASPECT:
+    roi = card_np[search_y1:search_y2, search_x1:search_x2]
+    if roi.size == 0:
         return None
 
-    return {
-        "bar_width_px":  float(bar_w),
-        "bar_height_px": float(bar_h),
-        "local_x1": x_start,
-        "local_y1": top_row + y_offset,
-        "local_x2": x_end,
-        "local_y2": bot_row + y_offset,
-        "strip": strip,
-        "aspect": round(aspect, 2),
-    }
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    _, thresh = cv2.threshold(gray_roi, _BAR_LUMINANCE_THRESH, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    best_candidate = None
+    max_score = 0.0
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        long_side = max(w, h)
+        short_side = min(w, h)
+        aspect = long_side / max(short_side, 1)
+
+        if aspect >= _BAR_MIN_ASPECT and long_side >= (_BAR_MIN_WIDTH_FRAC * W * 0.5):
+            area = cv2.contourArea(cnt)
+            rect_area = w * h
+            solidity = area / float(rect_area) if rect_area > 0 else 0
+            
+            if solidity > 0.5:
+                score = aspect * solidity
+                if score > max_score:
+                    max_score = score
+                    best_candidate = {
+                        "bar_width_px": float(long_side),
+                        "bar_height_px": float(short_side),
+                        "local_x1": int(search_x1 + x),
+                        "local_y1": int(search_y1 + y),
+                        "local_x2": int(search_x1 + x + w),
+                        "local_y2": int(search_y1 + y + h),
+                        "aspect": round(aspect, 2),
+                        "orientation": "horizontal" if w >= h else "vertical",
+                        "method": "ocr_anchored"
+                    }
+
+    return best_candidate
+
+
+# ── Contour-Based Multi-Orientation Fallback Detector ─────────────────────────
+
+def _find_bar_oriented(card_np: np.ndarray) -> dict | None:
+    """Fallback detector scanning entire card using adaptive thresholding & shape analysis."""
+    H, W = card_np.shape[:2]
+    gray = cv2.cvtColor(card_np, cv2.COLOR_RGB2GRAY)
+    
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, _BAR_LUMINANCE_THRESH, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_candidate = None
+    max_score = 0.0
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        long_side = max(w, h)
+        short_side = min(w, h)
+        aspect = long_side / max(short_side, 1)
+
+        if aspect >= _BAR_MIN_ASPECT and (long_side >= _BAR_MIN_WIDTH_FRAC * max(W, H)):
+            if short_side <= _BAR_MAX_HEIGHT_FRAC * min(W, H):
+                area = cv2.contourArea(cnt)
+                rect_area = w * h
+                solidity = area / float(rect_area) if rect_area > 0 else 0
+                
+                if solidity > 0.6:
+                    score = aspect * solidity
+                    if score > max_score:
+                        max_score = score
+                        best_candidate = {
+                            "bar_width_px": float(long_side),
+                            "bar_height_px": float(short_side),
+                            "local_x1": int(x),
+                            "local_y1": int(y),
+                            "local_x2": int(x + w),
+                            "local_y2": int(y + h),
+                            "aspect": round(aspect, 2),
+                            "orientation": "horizontal" if w >= h else "vertical",
+                            "method": "contour_scan"
+                        }
+
+    return best_candidate
 
 
 def _detect_calibration_bar(
     card_img: Image.Image,
     card_bbox_frac: list[float],
     full_img_size: tuple,
+    ocr_regions: list = None
 ) -> dict:
-    card_np = np.array(card_img.convert("RGB"))
-    card_H, card_W = card_np.shape[:2]
+    """
+    Main calibration bar entry point. First attempts OCR-guided detection.
+    If unanchored, tests cardinal rotations (0°, 90°, 180°, 270°) to find rotated bars.
+    """
+    orig_card_np = np.array(card_img.convert("RGB"))
     cx1, cy1, cx2, cy2 = card_bbox_frac
 
-    for strip in ["top", "bottom"]:
-        bar = _find_bar_in_strip(card_np, strip)
-        if bar is None:
-            continue
+    def to_full_frac(lx, ly, current_w, current_h):
+        fx = cx1 + (lx / current_w) * (cx2 - cx1)
+        fy = cy1 + (ly / current_h) * (cy2 - cy1)
+        return fx, fy
 
-        def to_full_frac_x(lx): return cx1 + (lx / card_W) * (cx2 - cx1)
-        def to_full_frac_y(ly): return cy1 + (ly / card_H) * (cy2 - cy1)
+    # 1. Primary Strategy: Find bar spatially near "8 cm" / "this bar" text
+    if ocr_regions:
+        ocr_bar = _find_bar_near_ocr_anchor(orig_card_np, ocr_regions)
+        if ocr_bar is not None:
+            card_H, card_W = orig_card_np.shape[:2]
+            fx1, fy1 = to_full_frac(ocr_bar["local_x1"], ocr_bar["local_y1"], card_W, card_H)
+            fx2, fy2 = to_full_frac(ocr_bar["local_x2"], ocr_bar["local_y2"], card_W, card_H)
 
-        bar_frac = [
-            max(0.0, to_full_frac_x(bar["local_x1"])),
-            max(0.0, to_full_frac_y(bar["local_y1"])),
-            min(1.0, to_full_frac_x(bar["local_x2"])),
-            min(1.0, to_full_frac_y(bar["local_y2"])),
-        ]
-        log.info(
-            f"Bar found in {strip} strip: "
-            f"{bar['bar_width_px']:.0f}×{bar['bar_height_px']:.0f}px "
-            f"aspect={bar['aspect']}"
-        )
-        return {"found": True, "bbox_frac": bar_frac,
-                "bar_width_px": bar["bar_width_px"], "strip": strip}
+            bar_frac = [
+                max(0.0, min(fx1, fx2)), max(0.0, min(fy1, fy2)),
+                min(1.0, max(fx1, fx2)), min(1.0, max(fy1, fy2)),
+            ]
+            log.info(f"Calibration bar found via OCR Anchor: {ocr_bar['bar_width_px']:.0f}px")
+            return {
+                "found": True,
+                "bbox_frac": bar_frac,
+                "bar_width_px": ocr_bar["bar_width_px"],
+                "orientation": ocr_bar["orientation"],
+                "method": "ocr_anchored"
+            }
 
-    return {"found": False, "bbox_frac": None, "bar_width_px": None}
+    # 2. Fallback Strategy: Cardinal rotation scan using geometric shapes
+    for rot_k in range(4):
+        rotated_np = np.rot90(orig_card_np, k=rot_k)
+        rH, rW = rotated_np.shape[:2]
 
+        bar = _find_bar_oriented(rotated_np)
+        if bar is not None:
+            rx1, ry1, rx2, ry2 = bar["local_x1"], bar["local_y1"], bar["local_x2"], bar["local_y2"]
 
-# ── Card detection with specific queries and confidence estimation ───────────
+            # Coordinate re-projection math across rotations
+            if rot_k == 0:
+                x1, y1, x2, y2 = rx1, ry1, rx2, ry2
+            elif rot_k == 1:
+                x1, y1, x2, y2 = ry1, rW - rx2, ry2, rW - rx1
+            elif rot_k == 2:
+                x1, y1, x2, y2 = rW - rx2, rH - ry2, rW - rx1, rH - ry1
+            elif rot_k == 3:
+                x1, y1, x2, y2 = rH - ry2, rx1, rH - ry1, rx2
+
+            card_H, card_W = orig_card_np.shape[:2]
+            fx1, fy1 = to_full_frac(x1, y1, card_W, card_H)
+            fx2, fy2 = to_full_frac(x2, y2, card_W, card_H)
+
+            bar_frac = [
+                max(0.0, min(fx1, fx2)), max(0.0, min(fy1, fy2)),
+                min(1.0, max(fx1, fx2)), min(1.0, max(fy1, fy2)),
+            ]
+
+            log.info(f"Bar detected via shape scan (rot={rot_k*90}°): {bar['bar_width_px']:.0f}px")
+            return {
+                "found": True,
+                "bbox_frac": bar_frac,
+                "bar_width_px": bar["bar_width_px"],
+                "orientation": bar["orientation"],
+                "method": "contour_scan"
+            }
+
+    return {"found": False, "bbox_frac": None, "bar_width_px": None, "orientation": None}
+
 
 def _detect_card(image: Image.Image) -> dict:
     """Locate the reference card using object detection queries."""
@@ -209,9 +297,9 @@ def _detect_card(image: Image.Image) -> dict:
             height = y2 - y1
             aspect = width / height if height > 0 else 0
 
-            if area_frac > 0.01 and 0.5 <= aspect <= 3.0: # Relaxed aspect/area cutoffs
+            if area_frac > 0.01 and 0.5 <= aspect <= 3.0:
                 confidence = round(d.get("score", 0.95), 2)
-                log.info(f"Card detected via '{query}': area={area_frac:.1%} aspect={aspect:.2f} score={confidence}")
+                log.info(f"Card detected via '{query}': area={area_frac:.1%} aspect={aspect:.2f}")
                 return {
                     "found": True,
                     "bbox_frac": d["bbox_frac"],
@@ -221,20 +309,14 @@ def _detect_card(image: Image.Image) -> dict:
     return {"found": False, "bbox_frac": None, "confidence": None}
 
 
-# ── Scale factor ──────────────────────────────────────────────────────────────
-
 def compute_scale_factor(
-    img_width: int,
-    img_height: int,
-    bar_bbox_frac: list[float],
+    apparent_bar_px: float | None,
     card_angle_deg: float = 0.0,
 ) -> dict:
-    x1, y1, x2, y2 = bar_bbox_frac
-    apparent_bar_px = (x2 - x1) * img_width
-
-    if apparent_bar_px < MIN_BAR_WIDTH_PX:
-        return {"px_per_cm": None,
-                "error": f"bar too narrow ({apparent_bar_px:.1f}px < {MIN_BAR_WIDTH_PX})"}
+    """Computes physical px_per_cm scale factor based on calibration bar width."""
+    if apparent_bar_px is None or apparent_bar_px < MIN_BAR_WIDTH_PX:
+        measured = f"{apparent_bar_px:.1f}" if apparent_bar_px is not None else "None"
+        return {"px_per_cm": None, "error": f"bar too narrow ({measured}px < {MIN_BAR_WIDTH_PX})"}
 
     tilt_corrected = abs(card_angle_deg) > 5
     if tilt_corrected:
@@ -261,9 +343,8 @@ def compute_scale_factor(
     }
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
-
 def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
+    """Stage 2 primary runner function."""
     result = {
         "response_id":          response_id,
         "card_found":           False,
@@ -272,10 +353,13 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
         "card_bbox":            None,
         "calibration_bar_bbox": None,
         "card_angle_deg":       0.0,
+        "corrected_bar_px":     None,
         "scale_error":          None,
         "stage2_flags":         [],
         "ocr_anchor_matches":   [],
-        "bar_width_px":        None,
+        "bar_width_px":         None,
+        "calibration_bar_orientation": None,
+        "privacy_flag":         False,
     }
 
     try:
@@ -287,17 +371,16 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
 
     W, H = img.size
 
-    # ── OCR gate ───────────────────────────────────────────────────────────────
+    # 1. OCR Gate
     gate = _ocr_anchor_gate(img)
     result["ocr_anchor_matches"] = gate["matched"]
 
     if not gate["pass"]:
-        result["card_found"] = False
         result["stage2_flags"].append("card_absent_ocr_gate")
-        log.info(f"{response_id}: OCR gate REJECT ({len(gate['matched'])} anchors). Card absent.")
+        log.info(f"{response_id}: OCR gate REJECT. Card absent.")
         return result
 
-    # ── Card detection (OVD) ──────────────────────────────────────────────────
+    # 2. Card Detection
     card = _detect_card(img)
     result["card_found"]      = card["found"]
     result["card_bbox"]       = card["bbox_frac"]
@@ -305,31 +388,34 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
 
     if not card["found"]:
         result["stage2_flags"].append("card_not_found_ovd")
-        log.info(f"{response_id}: Card not found by OVD despite OCR anchors present.")
+        log.info(f"{response_id}: Card not found by OVD despite OCR anchors.")
         return result
 
-    # ── Bar detection ─────────────────────────────────────────────────────────
+    # 3. Bar Detection (Using OCR regions passed into detector)
     card_img = bbox_crop(img, card["bbox_frac"])
-    bar = _detect_calibration_bar(card_img, card["bbox_frac"], (W, H))
+    bar = _detect_calibration_bar(card_img, card["bbox_frac"], (W, H), gate.get("ocr_regions"))
+    
     result["calibration_bar_bbox"] = bar.get("bbox_frac")
-    result["bar_width_px"] = bar.get("bar_width_px")    
+    result["bar_width_px"] = bar.get("bar_width_px")
+    result["calibration_bar_orientation"] = bar.get("orientation")
+
     if not bar["found"]:
         result["scale_error"] = "bar_not_found"
         result["stage2_flags"].append("bar_not_found")
         log.info(f"{response_id}: Card found but calibration bar not detected.")
         return result
 
-    # ── Scale factor ───────────────────────────────────────────────────────────
-    scale = compute_scale_factor(W, H, bar["bbox_frac"], result["card_angle_deg"])
-    result["px_per_cm"]   = scale.get("px_per_cm")
-    result["scale_error"] = scale.get("error")
+    # 4. Scale Calculation
+    scale = compute_scale_factor(bar.get("bar_width_px"), result["card_angle_deg"])
+    result["px_per_cm"]       = scale.get("px_per_cm")
+    result["corrected_bar_px"] = scale.get("corrected_bar_px")
+    result["scale_error"]     = scale.get("error")
+
     if scale.get("error"):
         result["stage2_flags"].append("scale_out_of_range")
 
-    
-
     log.info(
         f"{response_id}: card_found=True confidence={result['card_confidence']} "
-        f"px_per_cm={result['px_per_cm']} bar_strip={bar.get('strip')}"
+        f"px_per_cm={result['px_per_cm']} method={bar.get('method')}"
     )
     return result

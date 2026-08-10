@@ -12,8 +12,8 @@ Metrics computed:
   • snellen_equiv      : approximate Snellen acuity (e.g. "20/80")
   • cap_height_cm      : physical cap height in centimetres
 
-  Contrast (pixel-level, from target crop)
-  ─────────────────────────────────────────
+  Contrast (pixel-level, cropped directly from the source image)
+  ─────────────────────────────────────────────────────────────
   • michelson_contrast : (Lmax - Lmin) / (Lmax + Lmin) — global luminance range
   • rms_contrast       : std(luminance) / 128 — overall variability
   • mad_contrast       : median absolute deviation — robust to glare/outliers
@@ -23,12 +23,18 @@ Metrics computed:
   ────────────
   • text_behavior_score / text_behavior_pred  : optical readability of the scene
   • human_difficulty_score / human_behavior_pred : acuity-adjusted reading difficulty
+
+Stage 3 detects *multiple* text blocks per submission. compute_all_metrics()
+computes the metrics above for every block, then flattens the metrics of the
+largest ("primary") block to top-level scalar fields (visual_angle_deg,
+logmar, michelson_contrast, ...) so downstream tooling (annotate.py,
+visualize.py) that expects one row of metrics per submission keeps working.
+The full per-block breakdown is still available under "text_blocks_metrics".
 """
 
 import math
 import logging
 import numpy as np
-from pathlib import Path
 from PIL import Image
 
 from config import VIEWING_DISTANCE_CM
@@ -74,16 +80,30 @@ def compute_size_metrics(cap_height_px: float, px_per_cm: float) -> dict:
     }
 
 
-# ── Pixel-level contrast (from target crop) ───────────────────────────────────
+# ── Pixel-level contrast (cropped directly from the source image) ─────────────
 
-def compute_pixel_contrast(target_crop_path: Path) -> dict:
+def compute_pixel_contrast(img_rgb: np.ndarray | None, bbox_px) -> dict:
+    """
+    Crop `bbox_px = (x1, y1, x2, y2)` out of `img_rgb` and compute contrast
+    metrics on the grayscale luminance channel.
+
+    Previously this read a pre-cropped file from crops_dir/{id}_target.jpg,
+    but nothing upstream in Stage 2/3 ever wrote crop files there, so this
+    always silently fell through to the empty result. Cropping directly from
+    the already-open source image removes that dependency entirely.
+    """
     empty = {"michelson_contrast": None, "rms_contrast": None,
              "mad_contrast": None, "mean_luminance": None}
-    if not target_crop_path.exists():
+    if img_rgb is None or bbox_px is None:
         return empty
 
-    img = Image.open(target_crop_path).convert("L")
-    arr = np.array(img, dtype=float)
+    x1, x2 = sorted((int(bbox_px[0]), int(bbox_px[2])))
+    y1, y2 = sorted((int(bbox_px[1]), int(bbox_px[3])))
+    crop = img_rgb[y1:y2, x1:x2]
+    if crop.size == 0:
+        return empty
+
+    arr = np.array(Image.fromarray(crop).convert("L"), dtype=float)
     if arr.size == 0:
         return empty
 
@@ -188,24 +208,81 @@ def predict_human_behavior(visual_angle: float | None, logmar: float | None,
 
 def compute_all_metrics(
     response_id: str,
-    cap_height_px: float | None,
+    text_blocks: list[dict] | None,
     px_per_cm: float | None,
-    text_rgb: list | None,
-    bg_rgb: list | None,
-    crops_dir: Path,
+    calib_bar_px: float | None,
+    image=None,
 ) -> dict:
-    size           = compute_size_metrics(cap_height_px, px_per_cm)
-    pixel_contrast = compute_pixel_contrast(crops_dir / f"{response_id}_target.jpg")
-    color_contrast = compute_color_contrast(text_rgb, bg_rgb)
-    predictions    = predict_human_behavior(
-        visual_angle=size.get("visual_angle_deg"),
-        logmar=size.get("logmar"),
-        michelson=pixel_contrast.get("michelson_contrast"),
-        rms=pixel_contrast.get("rms_contrast"),
-    )
-    return {
-        "response_id": response_id,
-        **size,
-        **pixel_contrast,
-        **predictions,
-    }
+    """
+    Compute size/contrast/readability metrics for every text block Stage 3
+    detected for this submission.
+
+    Args:
+        text_blocks:  Stage 3's `text_blocks` list — each dict must have at
+                       least "height_px" and "bbox_px".
+        px_per_cm:    calibration scale factor from Stage 2.
+        calib_bar_px: measured/corrected width of the 8cm calibration bar in
+                       pixels (Stage 2's "corrected_bar_px") — used for the
+                       relative visual-angle-to-bar ratio.
+        image:        the full (uncropped) PIL.Image or RGB np.ndarray for
+                       this submission, used to crop each block for
+                       pixel-level contrast. If omitted, contrast metrics
+                       are left as None.
+
+    Returns a flat dict: the metrics of the largest ("primary") text block
+    are promoted to top-level scalar keys (visual_angle_deg, logmar,
+    snellen_equiv, cap_height_cm, michelson_contrast, rms_contrast,
+    mad_contrast, mean_luminance, human_difficulty_score,
+    human_behavior_pred, target_bbox, visual_angle_calib_multiples), plus
+    the full per-block breakdown under "text_blocks_metrics".
+    """
+    img_rgb = None
+    if image is not None:
+        img_rgb = np.array(image.convert("RGB")) if isinstance(image, Image.Image) else image
+
+    per_block = []
+    for block in (text_blocks or []):
+        cap_height_px = block.get("height_px")
+        size = compute_size_metrics(cap_height_px, px_per_cm)
+        pixel_contrast = compute_pixel_contrast(img_rgb, block.get("bbox_px"))
+
+        if cap_height_px and calib_bar_px:
+            relative_ratio = round(cap_height_px / calib_bar_px, 4)
+        else:
+            relative_ratio = block.get("relative_ratio_to_bar")
+
+        predictions = predict_human_behavior(
+            visual_angle=size.get("visual_angle_deg"),
+            logmar=size.get("logmar"),
+            michelson=pixel_contrast.get("michelson_contrast"),
+            rms=pixel_contrast.get("rms_contrast"),
+        )
+
+        per_block.append({
+            "label":     block.get("label"),
+            "bbox_frac": block.get("bbox_frac"),
+            "bbox_px":   block.get("bbox_px"),
+            **size,
+            "visual_angle_calib_multiples": relative_ratio,
+            **pixel_contrast,
+            **predictions,
+        })
+
+    result = {"response_id": response_id, "text_blocks_metrics": per_block}
+    if not per_block:
+        return result
+
+    # "Primary" block = largest bounding box — the most likely candidate for
+    # the actual sign/label being read, rather than incidental background text.
+    def _area(b):
+        bp = b.get("bbox_px") or [0, 0, 0, 0]
+        return abs(bp[2] - bp[0]) * abs(bp[3] - bp[1])
+
+    primary = max(per_block, key=_area)
+    result["target_bbox"] = primary.get("bbox_frac")
+    for key, val in primary.items():
+        if key in ("label", "bbox_frac", "bbox_px"):
+            continue
+        result[key] = val
+
+    return result
