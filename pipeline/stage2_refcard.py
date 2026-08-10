@@ -2,7 +2,8 @@
 Stage 2 — Reference Card Detection & Calibration
 ================================================
 Updates:
-- OCR Spatial Search: Locates '8 cm' / 'this bar' text anchor to lock onto the calibration bar.
+- OCR Spatial Search: Locates '8 cm' / 'this bar' text anchor to lock onto calibration bar.
+- Angle Estimation: Uses cv2.minAreaRect on cropped card to compute card_angle_deg automatically.
 - Orientation Invariance: Rotates card in 90-degree steps to handle rotated photos.
 - Parquet Compatible: Clean return dictionary with no raw PIL image objects.
 """
@@ -58,6 +59,39 @@ def bbox_crop(img: Image.Image, bbox_frac: list[float]) -> Image.Image:
     ))
 
 
+def _estimate_card_angle(card_img: Image.Image) -> float:
+    """
+    Estimates the rotation angle of the card inside its bounding box
+    using OpenCV's minimum area rectangle.
+    Returns angle in degrees in range [-45, 45].
+    """
+    card_np = np.array(card_img.convert("L"))
+    
+    # Threshold to separate white/light card stock from background
+    _, thresh = cv2.threshold(card_np, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+
+    # Find largest contour (assumed to be the card)
+    largest_cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest_cnt) < (card_np.shape[0] * card_np.shape[1] * 0.1):
+        return 0.0
+
+    # Compute minimum area oriented rectangle
+    rect = cv2.minAreaRect(largest_cnt)
+    (w, h), angle = rect[1], rect[2]
+
+    # Normalize OpenCV angle convention so 0° represents a landscape card
+    if w < h:
+        angle = angle - 90.0 if angle > 0 else angle + 90.0
+
+    # Clamp extreme outlier angles to MAX_CARD_ANGLE_DEG
+    angle = max(-MAX_CARD_ANGLE_DEG, min(MAX_CARD_ANGLE_DEG, angle))
+    return round(float(angle), 2)
+
+
 def _ocr_anchor_gate(img: Image.Image) -> dict:
     """Run OCR on full image to verify presence of reference card anchors."""
     try:
@@ -86,7 +120,6 @@ def _find_bar_near_ocr_anchor(card_np: np.ndarray, ocr_regions: list) -> dict | 
     for r in ocr_regions:
         txt = r.get("text", "").lower()
         if "8 cm" in txt or "8cm" in txt or "this bar" in txt:
-            # Found spatial anchor! Convert bounding box coordinates
             if "bbox_px" in r:
                 anchor_box = r["bbox_px"]
             elif "bbox_frac" in r:
@@ -97,7 +130,6 @@ def _find_bar_near_ocr_anchor(card_np: np.ndarray, ocr_regions: list) -> dict | 
     if not anchor_box:
         return None
 
-    # Search in a region expanded around the text label (above/below/adjacent)
     ax1, ay1, ax2, ay2 = anchor_box
     search_y1 = max(0, ay1 - int(0.15 * H))
     search_y2 = min(H, ay2 + int(0.15 * H))
@@ -182,7 +214,7 @@ def _find_bar_oriented(card_np: np.ndarray) -> dict | None:
                             "local_x1": int(x),
                             "local_y1": int(y),
                             "local_x2": int(x + w),
-                            "local_y2": int(y + h),
+                            "local_y2": int(x + h),
                             "aspect": round(aspect, 2),
                             "orientation": "horizontal" if w >= h else "vertical",
                             "method": "contour_scan"
@@ -200,20 +232,24 @@ def _detect_calibration_bar(
     """
     Main calibration bar entry point. First attempts OCR-guided detection.
     If unanchored, tests cardinal rotations (0°, 90°, 180°, 270°) to find rotated bars.
+    Includes boundary clamping to prevent bounding boxes from exceeding card crop bounds.
     """
     orig_card_np = np.array(card_img.convert("RGB"))
+    card_H, card_W = orig_card_np.shape[:2]
     cx1, cy1, cx2, cy2 = card_bbox_frac
 
     def to_full_frac(lx, ly, current_w, current_h):
-        fx = cx1 + (lx / current_w) * (cx2 - cx1)
-        fy = cy1 + (ly / current_h) * (cy2 - cy1)
+        # Strict clamping to local card pixel limits
+        lx_clamped = max(0, min(lx, current_w))
+        ly_clamped = max(0, min(ly, current_h))
+        fx = cx1 + (lx_clamped / current_w) * (cx2 - cx1)
+        fy = cy1 + (ly_clamped / current_h) * (cy2 - cy1)
         return fx, fy
 
     # 1. Primary Strategy: Find bar spatially near "8 cm" / "this bar" text
     if ocr_regions:
         ocr_bar = _find_bar_near_ocr_anchor(orig_card_np, ocr_regions)
         if ocr_bar is not None:
-            card_H, card_W = orig_card_np.shape[:2]
             fx1, fy1 = to_full_frac(ocr_bar["local_x1"], ocr_bar["local_y1"], card_W, card_H)
             fx2, fy2 = to_full_frac(ocr_bar["local_x2"], ocr_bar["local_y2"], card_W, card_H)
 
@@ -249,7 +285,6 @@ def _detect_calibration_bar(
             elif rot_k == 3:
                 x1, y1, x2, y2 = rH - ry2, rx1, rH - ry1, rx2
 
-            card_H, card_W = orig_card_np.shape[:2]
             fx1, fy1 = to_full_frac(x1, y1, card_W, card_H)
             fx2, fy2 = to_full_frac(x2, y2, card_W, card_H)
 
@@ -391,8 +426,12 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
         log.info(f"{response_id}: Card not found by OVD despite OCR anchors.")
         return result
 
-    # 3. Bar Detection (Using OCR regions passed into detector)
+    # 3. Crop Card & Estimate Tilt Angle (cv2.minAreaRect)
     card_img = bbox_crop(img, card["bbox_frac"])
+    result["card_angle_deg"] = _estimate_card_angle(card_img)
+    log.info(f"{response_id}: Card tilt angle estimated as {result['card_angle_deg']}°")
+
+    # 4. Calibration Bar Detection
     bar = _detect_calibration_bar(card_img, card["bbox_frac"], (W, H), gate.get("ocr_regions"))
     
     result["calibration_bar_bbox"] = bar.get("bbox_frac")
@@ -405,17 +444,18 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
         log.info(f"{response_id}: Card found but calibration bar not detected.")
         return result
 
-    # 4. Scale Calculation
+    # 5. Scale Calculation (Uses result['card_angle_deg'] for cosine correction)
     scale = compute_scale_factor(bar.get("bar_width_px"), result["card_angle_deg"])
-    result["px_per_cm"]       = scale.get("px_per_cm")
+    result["px_per_cm"]        = scale.get("px_per_cm")
     result["corrected_bar_px"] = scale.get("corrected_bar_px")
-    result["scale_error"]     = scale.get("error")
+    result["scale_error"]      = scale.get("error")
 
     if scale.get("error"):
         result["stage2_flags"].append("scale_out_of_range")
 
     log.info(
         f"{response_id}: card_found=True confidence={result['card_confidence']} "
-        f"px_per_cm={result['px_per_cm']} method={bar.get('method')}"
+        f"angle={result['card_angle_deg']}° px_per_cm={result['px_per_cm']} "
+        f"method={bar.get('method')}"
     )
     return result

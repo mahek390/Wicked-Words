@@ -30,10 +30,12 @@ import pipeline.stage4_metrics    as s4
 import pipeline.stage5_fusion     as s5
 # ── IMPORT ANNOTATOR MODULE HERE ──────────────────────────────────────────────
 import pipeline.stage2_stage3_annotator as annotator
+# pipeline.drive_fetch is imported lazily below, only if --from-drive is used,
+# so the local-folder path never needs the Google API packages installed.
 
 from config import (
     IMAGE_DIR, CSV_PATH, CROPS_DIR, OUTPUTS_DIR, DEIDENT_IMAGE_DIR,
-    VIEWING_DISTANCE_CM,
+    VIEWING_DISTANCE_CM, DRIVE_FOLDER_ID,
 )
 
 logging.basicConfig(
@@ -47,10 +49,18 @@ log = logging.getLogger("runner")
 ANNOTATED_DIR = OUTPUTS_DIR / "annotated_images"
 
 
-def run(csv_path: Path, image_dir: Path, limit: int | None = None):
+def run(csv_path: Path, image_dir: Path, limit: int | None = None, from_drive: bool = False):
     log.info("=" * 60)
     log.info("Wicked Words Pipeline starting")
     log.info("=" * 60)
+
+    # ── Stage 0.5: Sync photos from Google Drive (only if the user opts in) ───
+    if from_drive:
+        import pipeline.drive_fetch as drive_fetch
+        log.info("\n── Syncing images from Google Drive ──")
+        drive_fetch.sync_images_from_drive(image_dir)
+    else:
+        log.info(f"Using local image folder: {image_dir}")
 
     # ── Stage 1: Data cleaning ────────────────────────────────────────────────
     log.info("\n── Stage 1: Data cleaning ──")
@@ -180,5 +190,7 @@ if __name__ == "__main__":
     parser.add_argument("--csv",    type=Path, default=CSV_PATH,  help="Path to Qualtrics CSV export")
     parser.add_argument("--images", type=Path, default=IMAGE_DIR, help="Directory of submitted images")
     parser.add_argument("--limit",  type=int,  default=None,      help="Process only first N image rows (for testing)")
+    parser.add_argument("--from-drive", action="store_true",
+                         help="Sync images from the Drive folder (config.DRIVE_FOLDER_ID) into --images before running")
     args = parser.parse_args()
-    run(args.csv, args.images, args.limit)
+    run(args.csv, args.images, args.limit, args.from_drive)

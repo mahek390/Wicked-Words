@@ -1,5 +1,6 @@
 # Secrets
 .env
+service-account-key.json
 
 # Data (not committed — shared via Drive)
 Data/

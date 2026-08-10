@@ -268,18 +268,27 @@ def draw_annotations_and_dashboard(
     draw.text((x1c, H + 96),  f"Environment: {env_text}",   fill=(180, 180, 180), font=fb)
     draw.text((x1c, H + 116), f"Personal:    {personal}",   fill=(180, 180, 180), font=fb)
 
-    # ── Col 2: Card metrics ───────────────────────────────────────────────────
+    # ── Calculate WCAG Contrast ───────────────────────────────────
+    # Background: ~90th percentile (card baseline), Foreground: ~10th percentile (ink baseline)
+    gray_np = np.array(img.convert("L"), dtype=float)
+    L_bg = np.percentile(gray_np, 90) / 255.0
+    L_fg = np.percentile(gray_np, 10) / 255.0
+    
+    # WCAG Relative Luminance Contrast Formula: (L1 + 0.05) / (L2 + 0.05)
+    contrast_ratio = (L_bg + 0.05) / (L_fg + 0.05)
+    # ── Col 2: Card Metrics ───────────────────────────────────────
     x2c = int(W * 0.44)
     draw.text((x2c, H + 12), "CARD METRICS", fill=(0, 255, 0), font=ft)
-    draw.text((x2c, H + 36), f"px / cm:      {card_info.get('px_per_cm', 'N/A')}",  fill=(255, 255, 255), font=fb)
-    draw.text((x2c, H + 56), f"Bar width:    {card_info.get('bar_width_px', 'N/A'):.0f} px = 8 cm"
-              if isinstance(card_info.get("bar_width_px"), float) else
-              f"Bar width:    {card_info.get('bar_width_px', 'N/A')} px = 8 cm",
-              fill=(255, 0, 255), font=fb)
+    draw.text((x2c, H + 36), f"px / cm:      {card_info.get('px_per_cm', 'N/A')}", fill=(255, 255, 255), font=fb)
+    
+    bar_width = card_info.get("bar_width_px")
+    bar_str = f"{bar_width:.0f}" if isinstance(bar_width, (float, int)) else str(bar_width)
+    draw.text((x2c, H + 56), f"Bar width:    {bar_str} px = 8 cm", fill=(255, 0, 255), font=fb)
+    
     draw.text((x2c, H + 76), f"Confidence:   {card_info.get('card_confidence', 'N/A')}", fill=(220, 220, 220), font=fb)
-    if is_digital:
-        draw.text((x2c, H + 96), "Screen type:  DIGITAL  (WCAG enabled)", fill=(250, 204, 21), font=fb)
-
+    
+    # Always display WCAG contrast ratio
+    draw.text((x2c, H + 96), f"WCAG Contrast: {contrast_ratio:.1f}:1", fill=(250, 204, 21), font=fb)
     # ── Col 3: Text metrics ───────────────────────────────────────────────────
     x3c = int(W * 0.72)
     draw.text((x3c, H + 12), "TEXT METRICS", fill=(255, 215, 0), font=ft)

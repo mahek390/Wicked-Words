@@ -12,3 +12,5 @@ timm
 einops
 tqdm
 opencv-python-headless
+google-api-python-client
+google-auth

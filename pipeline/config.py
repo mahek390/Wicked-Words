@@ -29,6 +29,13 @@ DEIDENT_CSV_PATH  = DEIDENT_DIR / "survey_deidentified.csv"
 # Florence-2 runs locally on Apple Silicon — no API key needed
 FLORENCE_MODEL_ID = "microsoft/Florence-2-large"
 
+# ── Google Drive source ──────────────────────────────────────────────────────
+# Photos can be synced from a shared Drive folder into IMAGE_DIR instead of
+# being copied in by hand. Auth is via a service account — share the folder
+# with that account's client_email as a Viewer. See pipeline/drive_fetch.py.
+DRIVE_FOLDER_ID           = os.getenv("DRIVE_FOLDER_ID", "")
+DRIVE_SERVICE_ACCOUNT_FILE = ROOT / os.getenv("DRIVE_SERVICE_ACCOUNT_FILE", "service-account-key.json")
+
 # ── Calibration ───────────────────────────────────────────────────────────────
 CALIB_BAR_CM        = 8.0    # physical width of the calibration bar on the reference card
 VIEWING_DISTANCE_CM = 40.0   # standard viewing distance specified on the card (16 in)
