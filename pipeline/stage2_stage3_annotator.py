@@ -277,8 +277,7 @@ def draw_annotations_and_dashboard(
               f"Bar width:    {card_info.get('bar_width_px', 'N/A')} px = 8 cm",
               fill=(255, 0, 255), font=fb)
     draw.text((x2c, H + 76), f"Confidence:   {card_info.get('card_confidence', 'N/A')}", fill=(220, 220, 220), font=fb)
-    if is_digital:
-        draw.text((x2c, H + 96), "Screen type:  DIGITAL  (WCAG enabled)", fill=(250, 204, 21), font=fb)
+    draw.text((x2c, H + 96),fill=(250, 204, 21), font=fb)
 
     # ── Col 3: Text metrics ───────────────────────────────────────────────────
     x3c = int(W * 0.72)
