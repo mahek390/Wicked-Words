@@ -87,16 +87,21 @@ def detect_object(image: Image.Image, query: str) -> list[dict]:
     labels = out.get("bboxes_labels", [])
 
     detections = []
+    total_area = W * H
     for bbox, label in zip(bboxes, labels):
         x1, y1, x2, y2 = bbox
+        area = (x2 - x1) * (y2 - y1)
+        # Normalized area fraction capped at 1.0 — larger detections are more
+        # likely to be the primary object Florence-2 matched to the query.
+        area_frac = min(area / total_area, 1.0)
         detections.append({
             "label": label,
             "bbox_frac": [round(x1/W, 4), round(y1/H, 4),
                           round(x2/W, 4), round(y2/H, 4)],
             "bbox_px": [x1, y1, x2, y2],
-            "area": (x2 - x1) * (y2 - y1),
+            "area": area,
+            "area_frac": round(area_frac, 4),
         })
-    # Largest detection first (most likely the main object)
     detections.sort(key=lambda d: d["area"], reverse=True)
     return detections
 

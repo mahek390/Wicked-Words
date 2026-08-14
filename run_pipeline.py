@@ -22,7 +22,6 @@ from PIL import Image
 base_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(base_dir, "pipeline"))
 
-import pipeline.stage0_deidentify as s0
 import pipeline.stage1_cleaning   as s1
 import pipeline.stage2_refcard    as s2
 import pipeline.stage3_target     as s3

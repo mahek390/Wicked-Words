@@ -270,21 +270,22 @@ def _detect_calibration_bar(
     return {"found": False, "bbox_frac": None, "bar_width_px": None, "orientation": None}
 
 
+# Specific queries carry higher base confidence than generic ones.
+# Blended with detection area fraction to produce a real signal.
+_CARD_QUERIES = [
+    ("wicked words card",              0.90),
+    ("visual acuity chart card",        0.85),
+    ("reference card with eye chart",   0.80),
+    ("postcard with text and eye test", 0.75),
+    ("white card held in hand",         0.55),
+    ("white rectangular card",          0.50),
+    ("card",                            0.40),
+]
+
+
 def _detect_card(image: Image.Image) -> dict:
     """Locate the reference card using object detection queries."""
-    specific_queries = [
-        "wicked words card",
-        "visual acuity chart card",
-        "reference card with eye chart",
-        "postcard with text and eye test",
-    ]
-    generic_queries = [
-        "white card held in hand",
-        "white rectangular card",
-        "card",
-    ]
-
-    for query in specific_queries + generic_queries:
+    for query, query_base in _CARD_QUERIES:
         try:
             detections = detect_object(image, query)
         except Exception:
@@ -293,20 +294,21 @@ def _detect_card(image: Image.Image) -> dict:
         for d in detections:
             x1, y1, x2, y2 = d["bbox_frac"]
             area_frac = (x2 - x1) * (y2 - y1)
-            width = x2 - x1
-            height = y2 - y1
-            aspect = width / height if height > 0 else 0
+            aspect = (x2 - x1) / (y2 - y1) if (y2 - y1) > 0 else 0
 
             if area_frac > 0.01 and 0.5 <= aspect <= 3.0:
-                confidence = round(d.get("score", 0.95), 2)
-                log.info(f"Card detected via '{query}': area={area_frac:.1%} aspect={aspect:.2f}")
+                # 60% query specificity + 40% normalized detection area.
+                # area_frac from detect_object is already normalized 0-1.
+                confidence = round(0.6 * query_base + 0.4 * d.get("area_frac", area_frac), 3)
+                log.info(f"Card detected via '{query}': area={area_frac:.1%} aspect={aspect:.2f} confidence={confidence}")
                 return {
                     "found": True,
                     "bbox_frac": d["bbox_frac"],
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "query": query,
                 }
 
-    return {"found": False, "bbox_frac": None, "confidence": None}
+    return {"found": False, "bbox_frac": None, "confidence": None, "query": None}
 
 
 def compute_scale_factor(
@@ -359,6 +361,7 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
         "ocr_anchor_matches":   [],
         "bar_width_px":         None,
         "calibration_bar_orientation": None,
+        "card_detection_query": None,
         "privacy_flag":         False,
     }
 
@@ -382,9 +385,10 @@ def process_image(response_id: str, image_path: Path, crops_dir: Path) -> dict:
 
     # 2. Card Detection
     card = _detect_card(img)
-    result["card_found"]      = card["found"]
-    result["card_bbox"]       = card["bbox_frac"]
-    result["card_confidence"] = card["confidence"]
+    result["card_found"]           = card["found"]
+    result["card_bbox"]             = card["bbox_frac"]
+    result["card_confidence"]       = card["confidence"]
+    result["card_detection_query"]  = card["query"]
 
     if not card["found"]:
         result["stage2_flags"].append("card_not_found_ovd")
